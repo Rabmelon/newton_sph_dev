@@ -683,6 +683,27 @@ add_example_test(
 )
 
 
+class TestSPHExamples(unittest.TestCase):
+    pass
+
+
+add_example_test(
+    TestSPHExamples,
+    name="sph.example_sph_granular",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 100, "smoothing-length": 0.15},
+    use_viewer=True,
+)
+
+add_example_test(
+    TestSPHExamples,
+    name="sph.example_sph_grain_rendering",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 50, "smoothing-length": 0.15},
+    use_viewer=True,
+)
+
+
 add_example_test(
     TestBasicExamples,
     name="basic.example_basic_plotting",

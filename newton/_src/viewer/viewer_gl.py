@@ -214,7 +214,8 @@ class ViewerGL(ViewerBase):
         fb_w, fb_h = self.renderer.window.get_framebuffer_size()
         self.camera = Camera(width=fb_w, height=fb_h, up_axis="Z")
 
-        self._paused = False
+        # self._paused = False
+        self._paused = True
 
         # Selection panel state
         self._selection_ui_state = {
