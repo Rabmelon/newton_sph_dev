@@ -241,6 +241,93 @@ def test_geostatic_initialization(test, device):
             test.assertLess(err_xx, 0.05, f"sigma_xx error {err_xx:.2%} at particle {i}")
 
 
+def test_sand_cube_dummy_boundary(test, device):
+    """A cube of sand with dummy boundary particles should stay inside the domain."""
+
+    N = 4
+    particles_per_cell = 3
+    smoothing_length = 0.15
+    particle_spacing = smoothing_length / particles_per_cell
+    dt = 0.001
+
+    builder = newton.ModelBuilder()
+    SolverSPH.register_custom_attributes(builder)
+
+    lo = (0.0, 0.0, 0.0)
+    hi_z = N * particles_per_cell * particle_spacing
+    hi = (hi_z, hi_z, hi_z)
+
+    builder.add_particle_grid(
+        pos=wp.vec3(0.5 * particle_spacing),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=N * particles_per_cell,
+        dim_y=N * particles_per_cell,
+        dim_z=N * particles_per_cell,
+        cell_x=particle_spacing,
+        cell_y=particle_spacing,
+        cell_z=particle_spacing,
+        mass=0.1,
+        jitter=0.0,
+        custom_attributes={"sph:friction": 0.5},
+    )
+
+    fluid_count = builder.particle_count
+
+    dummy_count = SolverSPH.add_dummy_particles(
+        builder,
+        bounds_lo=lo,
+        bounds_hi=hi,
+        h=smoothing_length,
+        dx=particle_spacing,
+        reference_density=2500.0,
+        slip_type="noslip",
+    )
+    test.assertGreater(dummy_count, 0, "Should have generated dummy particles")
+
+    model = builder.finalize(device=device)
+
+    config = SolverSPH.Config()
+    config.smoothing_length = smoothing_length
+    config.reference_density = 2500.0
+    config.boundary_type = "dummy"
+    config.xsph_epsilon = 0.0
+
+    state_0 = model.state()
+    state_1 = model.state()
+
+    solver = SolverSPH(model, config)
+
+    # Record initial dummy particle positions
+    init_pos = state_0.particle_q.numpy()
+    dummy_init_pos = init_pos[fluid_count:].copy()
+
+    for _ in range(50):
+        solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+        state_0, state_1 = state_1, state_0
+
+    final_pos = state_0.particle_q.numpy()
+
+    # Dummy particles should NOT have moved
+    dummy_final_pos = final_pos[fluid_count:]
+    max_displacement = np.max(np.abs(dummy_final_pos - dummy_init_pos))
+    test.assertAlmostEqual(
+        max_displacement,
+        0.0,
+        places=10,
+        msg=f"Dummy particles moved: max displacement = {max_displacement}",
+    )
+
+    # Fluid particles should stay roughly within the domain
+    fluid_final_pos = final_pos[:fluid_count]
+    fluid_z_min = np.min(fluid_final_pos[:, 2])
+    test.assertGreater(
+        fluid_z_min,
+        -smoothing_length,
+        f"Fluid particles fell below domain: min z = {fluid_z_min:.4f}",
+    )
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -259,6 +346,9 @@ add_function_test(
 add_function_test(TestSPH, "test_sand_cube_on_plane", test_sand_cube_on_plane, devices=devices, check_output=False)
 add_function_test(
     TestSPH, "test_geostatic_initialization", test_geostatic_initialization, devices=devices, check_output=False
+)
+add_function_test(
+    TestSPH, "test_sand_cube_dummy_boundary", test_sand_cube_dummy_boundary, devices=devices, check_output=False
 )
 
 

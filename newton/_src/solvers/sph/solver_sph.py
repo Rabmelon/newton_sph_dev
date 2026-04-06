@@ -36,6 +36,7 @@ from .sph_constitutive import (
     update_stress_dp_kernel,
     update_stress_mui_kernel,
 )
+from .sph_dummy_boundary import add_dummy_particles_to_builder
 from .sph_kernels import (
     compute_artificial_viscosity_kernel,
     compute_density_kernel,
@@ -64,8 +65,10 @@ class SolverSPH(SolverBase):
         """Configuration for :class:`SolverSPH`."""
 
         # --- SPH discretization ---
-        smoothing_length: float = 0.05
-        """SPH smoothing length h [m]. Typically 1.2-1.5x particle spacing."""
+        particle_spacing: float = 0.005
+        """Initial inter-particle distance dx [m]. Controls resolution."""
+        kh: float = 1.3
+        """Smoothing-length ratio: h = kh * particle_spacing."""
         kernel_type: str = "wendland_c2"
         """SPH kernel function: ``'wendland_c2'`` or ``'cubic_spline'``."""
         support_radius_factor: float = 2.0
@@ -96,6 +99,8 @@ class SolverSPH(SolverBase):
         """Dimension of :class:`wp.HashGrid` per axis."""
 
         # --- Boundary ---
+        boundary_type: str = "penalty"
+        """Boundary treatment: ``'penalty'`` (default) or ``'dummy'`` (layered dummy particles)."""
         penalty_stiffness: float = 1.0e6
         """SDF penalty boundary stiffness [N/m]."""
         penalty_damping: float = 1.0e3
@@ -106,6 +111,8 @@ class SolverSPH(SolverBase):
         """Optional domain lower bound for boundary clamping [m]."""
         domain_hi: tuple | None = None
         """Optional domain upper bound for boundary clamping [m]."""
+        dummy_beta: float = 1.7
+        """Distance-based dummy boundary extrapolation factor."""
 
         # --- Corrections ---
         xsph_epsilon: float = 0.5
@@ -131,6 +138,8 @@ class SolverSPH(SolverBase):
             - ``sph:dilatancy``: Dilatancy angle [rad]
             - ``sph:viscosity``: Dynamic viscosity [Pa*s]
             - ``sph:yield_pressure``: Yield pressure cap [Pa]
+            - ``sph:particle_type``: Particle type (0=fluid, 1=dummy no-slip, 2=dummy free-slip)
+            - ``sph:wall_normal``: Outward wall normal for dummy particles
 
         Attributes registered on State (per-particle):
             - ``sph:density``: Current density [kg/m^3]
@@ -154,6 +163,8 @@ class SolverSPH(SolverBase):
             ("dilatancy", wp.float32, 0.0),
             ("viscosity", wp.float32, 0.0),
             ("yield_pressure", wp.float32, 1.0e12),
+            ("particle_type", wp.int32, 0),
+            ("wall_normal", wp.vec3, wp.vec3(0.0)),
         ]:
             builder.add_custom_attribute(
                 CA(
@@ -186,6 +197,44 @@ class SolverSPH(SolverBase):
                 )
             )
 
+    @staticmethod
+    def add_dummy_particles(
+        builder: newton.ModelBuilder,
+        bounds_lo: tuple[float, float, float],
+        bounds_hi: tuple[float, float, float],
+        h: float,
+        dx: float,
+        reference_density: float,
+        slip_type: str = "noslip",
+    ) -> int:
+        """Generate and add layered dummy boundary particles.
+
+        Creates multiple layers of static particles outside each face of an
+        AABB domain box. Must be called after
+        :meth:`register_custom_attributes` and before ``builder.finalize()``.
+
+        Args:
+            builder: Newton model builder.
+            bounds_lo: Domain AABB lower corner [m].
+            bounds_hi: Domain AABB upper corner [m].
+            h: Smoothing length [m].
+            dx: Particle spacing [m].
+            reference_density: Reference density for mass computation [kg/m^3].
+            slip_type: ``'noslip'`` or ``'freeslip'``.
+
+        Returns:
+            Number of dummy particles added.
+        """
+        return add_dummy_particles_to_builder(
+            builder,
+            bounds_lo,
+            bounds_hi,
+            h,
+            dx,
+            reference_density,
+            slip_type,
+        )
+
     def __init__(
         self,
         model: newton.Model,
@@ -199,9 +248,9 @@ class SolverSPH(SolverBase):
 
         self._sph_model = SPHModel(model, config.reference_density)
 
-        # Derived parameters
-        self._h = config.smoothing_length
-        self._support_radius = config.support_radius_factor * config.smoothing_length
+        # Derived parameters: smoothing length computed from spacing and ratio
+        self._h = config.kh * config.particle_spacing
+        self._support_radius = config.support_radius_factor * self._h
 
         # Hash grid for neighbor search
         dim = config.hash_grid_dim
@@ -211,6 +260,10 @@ class SolverSPH(SolverBase):
         # Scratch arrays
         n = model.particle_count
         self._accel = wp.zeros(n, dtype=wp.vec3, device=model.device)
+
+        # Cached references for dummy boundary kernel args
+        self._particle_type = model.sph.particle_type
+        self._wall_normal = model.sph.wall_normal
 
     @property
     def config(self) -> Config:
@@ -276,8 +329,10 @@ class SolverSPH(SolverBase):
             if self._config.artificial_viscosity_alpha > 0.0:
                 self._compute_artificial_viscosity(state_in)
 
-            # 8. Boundary forces
-            self._apply_boundary_forces(state_in)
+            # 8. Boundary forces (penalty method only; dummy particles
+            #    handle boundaries through the SPH kernels themselves)
+            if self._config.boundary_type == "penalty":
+                self._apply_boundary_forces(state_in)
 
             # 9. Time integration (symplectic Euler, includes gravity)
             self._integrate(state_in, state_out, dt)
@@ -308,6 +363,7 @@ class SolverSPH(SolverBase):
                 state.particle_q,
                 self.model.particle_mass,
                 self.model.particle_flags,
+                self._particle_type,
                 self._h,
                 self._support_radius,
             ],
@@ -328,8 +384,12 @@ class SolverSPH(SolverBase):
                 self.model.particle_mass,
                 state.sph.density,
                 self.model.particle_flags,
+                self._particle_type,
+                self._wall_normal,
                 self._h,
                 self._support_radius,
+                self._config.dummy_beta,
+                self._config.reference_density,
             ],
             outputs=[state.sph.velocity_gradient],
             device=self.model.device,
@@ -369,6 +429,7 @@ class SolverSPH(SolverBase):
                 self.model.sph.cohesion,
                 self.model.sph.dilatancy,
                 self.model.particle_flags,
+                self._particle_type,
                 dt,
             ],
             outputs=[
@@ -395,6 +456,7 @@ class SolverSPH(SolverBase):
                 self.model.sph.cohesion,
                 self.model.sph.viscosity,
                 self.model.particle_flags,
+                self._particle_type,
                 self._config.reference_density,
                 self._config.sound_speed,
                 self._config.eos_exponent,
@@ -412,6 +474,8 @@ class SolverSPH(SolverBase):
         Uses density from state_in and updated stress from state_out.
         """
         n = self.model.particle_count
+        gravity_np = self.model.gravity.numpy()
+        gravity_vec = wp.vec3(float(gravity_np[0][0]), float(gravity_np[0][1]), float(gravity_np[0][2]))
         wp.launch(
             compute_stress_force_kernel,
             dim=n,
@@ -422,8 +486,11 @@ class SolverSPH(SolverBase):
                 state_in.sph.density,
                 state_out.sph.stress,
                 self.model.particle_flags,
+                self._particle_type,
                 self._h,
                 self._support_radius,
+                self._config.reference_density,
+                gravity_vec,
             ],
             outputs=[self._accel],
             device=self.model.device,
@@ -442,10 +509,14 @@ class SolverSPH(SolverBase):
                 self.model.particle_mass,
                 state.sph.density,
                 self.model.particle_flags,
+                self._particle_type,
+                self._wall_normal,
                 self._h,
                 self._support_radius,
                 self._config.artificial_viscosity_alpha,
                 self._config.sound_speed,
+                self._config.dummy_beta,
+                self._config.reference_density,
             ],
             outputs=[self._accel],
             device=self.model.device,
@@ -473,6 +544,7 @@ class SolverSPH(SolverBase):
                 state_in.particle_qd,
                 self._accel,
                 model.particle_flags,
+                self._particle_type,
                 model.particle_world,
                 model.gravity,
                 dt,
@@ -495,9 +567,13 @@ class SolverSPH(SolverBase):
                 self.model.particle_mass,
                 state.sph.density,
                 self.model.particle_flags,
+                self._particle_type,
+                self._wall_normal,
                 self._h,
                 self._support_radius,
                 self._config.xsph_epsilon,
+                self._config.dummy_beta,
+                self._config.reference_density,
             ],
             outputs=[state.particle_qd],
             device=self.model.device,
@@ -542,6 +618,7 @@ class SolverSPH(SolverBase):
                 state.particle_q,
                 self.model.sph.friction,
                 self.model.particle_flags,
+                self._particle_type,
                 self._config.reference_density,
                 g_mag,
                 y_max,

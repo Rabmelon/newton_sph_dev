@@ -1,3 +1,8 @@
+# Rabmelon person settings
+.context_snapshot/
+bash.exe.stackdump
+
+
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -6,7 +11,7 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual Environments 
+# Virtual Environments
 .venv
 
 # Tool cache

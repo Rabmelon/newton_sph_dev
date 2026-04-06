@@ -22,6 +22,7 @@ References:
 import warp as wp
 
 from ...geometry import ParticleFlags
+from .sph_dummy_boundary import SPH_FLUID
 
 wp.set_module_options({"enable_backward": False})
 
@@ -173,6 +174,7 @@ def update_stress_dp_kernel(
     cohesion: wp.array(dtype=float),
     dilatancy: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
     dt: float,
     # output (in-place for stress)
     stress_out: wp.array(dtype=wp.mat33),
@@ -187,9 +189,13 @@ def update_stress_dp_kernel(
         3. Apply Drucker-Prager return mapping.
         4. Compute pressure P = -tr(sigma) / 3.
         5. Accumulate equivalent plastic strain.
+
+    Dummy particles are skipped.
     """
     i = wp.tid()
     if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if particle_type[i] != SPH_FLUID:
         return
 
     E = young_modulus[i]
@@ -246,6 +252,7 @@ def update_stress_mui_kernel(
     cohesion: wp.array(dtype=float),
     viscosity: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
     reference_density: float,
     sound_speed: float,
     eos_gamma: float,
@@ -262,11 +269,15 @@ def update_stress_mui_kernel(
         4. Stress: sigma = 2 * eta * D_dev - P * I.
         5. Apply Drucker-Prager return mapping for safety.
 
+    Dummy particles are skipped.
+
     Reference:
         tiSPHi ``solver_sph_muI.py``.
     """
     i = wp.tid()
     if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if particle_type[i] != SPH_FLUID:
         return
 
     rho = density[i]
@@ -324,6 +335,7 @@ def initialize_geostatic_stress_kernel(
     pos: wp.array(dtype=wp.vec3),
     friction: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
     reference_density: float,
     g_mag: float,
     z_max: float,
@@ -336,10 +348,12 @@ def initialize_geostatic_stress_kernel(
     sigma_xx = sigma_yy = K0 * sigma_zz
     K0 = 1 - sin(phi)
 
-    Assumes Z-up coordinate system.
+    Assumes Z-up coordinate system. Dummy particles are skipped.
     """
     i = wp.tid()
     if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if particle_type[i] != SPH_FLUID:
         return
 
     z_i = pos[i][2]

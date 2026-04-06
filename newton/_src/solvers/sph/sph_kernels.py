@@ -18,6 +18,11 @@ References:
 import warp as wp
 
 from ...geometry import ParticleFlags
+from .sph_dummy_boundary import (
+    SPH_FLUID,
+    compute_virtual_stress,
+    compute_virtual_velocity,
+)
 
 wp.set_module_options({"enable_backward": False})
 
@@ -140,6 +145,7 @@ def compute_density_kernel(
     pos: wp.array(dtype=wp.vec3),
     mass: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
     h: float,
     support_radius: float,
     # output
@@ -148,9 +154,14 @@ def compute_density_kernel(
     """Compute SPH density via direct summation.
 
     .. math:: \\rho_i = \\sum_j m_j \\, W(|\\mathbf{x}_i - \\mathbf{x}_j|, h)
+
+    Dummy particles (``particle_type != 0``) are skipped as center particles
+    but contribute as neighbors.
     """
     i = wp.tid()
     if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if particle_type[i] != SPH_FLUID:
         return
 
     xi = pos[i]
@@ -182,17 +193,26 @@ def compute_velocity_gradient_kernel(
     mass: wp.array(dtype=float),
     density: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
+    wall_normal: wp.array(dtype=wp.vec3),
     h: float,
     support_radius: float,
+    dummy_beta: float,
+    reference_density: float,
     # output
     velocity_gradient: wp.array(dtype=wp.mat33),
 ):
     """Compute velocity gradient tensor L via SPH.
 
     .. math:: L_i = \\sum_j \\frac{m_j}{\\rho_j} (\\mathbf{v}_j - \\mathbf{v}_i) \\otimes \\nabla W_{ij}
+
+    For dummy neighbors, virtual velocity and reference density are used.
     """
     i = wp.tid()
     if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        velocity_gradient[i] = wp.mat33(0.0)
+        return
+    if particle_type[i] != SPH_FLUID:
         velocity_gradient[i] = wp.mat33(0.0)
         return
 
@@ -208,11 +228,15 @@ def compute_velocity_gradient_kernel(
             r_vec = xi - xj
             r = wp.length(r_vec)
             if r < support_radius and r > _EPSILON:
+                # Effective velocity and density for neighbor j
+                vj = vel[j]
                 rho_j = density[j]
+                if particle_type[j] != SPH_FLUID:
+                    vj = compute_virtual_velocity(vi, vel[j], dummy_beta, wall_normal[j], particle_type[j])
+                    rho_j = reference_density
                 if rho_j > _EPSILON:
                     grad_w = wendland_c2_grad_3d(r_vec, r, h)
-                    v_diff = vel[j] - vi
-                    # L += (m_j / rho_j) * outer(v_diff, grad_w)
+                    v_diff = vj - vi
                     L += (mass[j] / rho_j) * wp.outer(v_diff, grad_w)
 
     velocity_gradient[i] = L
@@ -252,8 +276,11 @@ def compute_stress_force_kernel(
     density: wp.array(dtype=float),
     stress: wp.array(dtype=wp.mat33),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
     h: float,
     support_radius: float,
+    reference_density: float,
+    gravity: wp.vec3,
     # output
     accel: wp.array(dtype=wp.vec3),
 ):
@@ -263,9 +290,13 @@ def compute_stress_force_kernel(
         \\mathbf{a}_i = \\sum_j m_j
         \\left(\\frac{\\boldsymbol{\\sigma}_i}{\\rho_i^2}
         + \\frac{\\boldsymbol{\\sigma}_j}{\\rho_j^2}\\right) \\cdot \\nabla W_{ij}
+
+    For dummy neighbors, virtual stress and reference density are used.
     """
     i = wp.tid()
     if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if particle_type[i] != SPH_FLUID:
         return
 
     xi = pos[i]
@@ -284,11 +315,21 @@ def compute_stress_force_kernel(
             r_vec = xi - xj
             r = wp.length(r_vec)
             if r < support_radius and r > _EPSILON:
+                # Effective stress and density for neighbor j
+                sigma_j = stress[j]
                 rho_j = density[j]
+                if particle_type[j] != SPH_FLUID:
+                    sigma_j = compute_virtual_stress(
+                        reference_density,
+                        gravity,
+                        xi,
+                        xj,
+                        sigma_i,
+                        particle_type[j],
+                    )
+                    rho_j = reference_density
                 if rho_j > _EPSILON:
                     grad_w = wendland_c2_grad_3d(r_vec, r, h)
-                    sigma_j = stress[j]
-                    # a += m_j * (sigma_i/rho_i^2 + sigma_j/rho_j^2) . grad_w
                     combined = sigma_i / (rho_i * rho_i) + sigma_j / (rho_j * rho_j)
                     a += mass[j] * (combined @ grad_w)
 
@@ -308,10 +349,14 @@ def compute_artificial_viscosity_kernel(
     mass: wp.array(dtype=float),
     density: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
+    wall_normal: wp.array(dtype=wp.vec3),
     h: float,
     support_radius: float,
     alpha_visc: float,
     sound_speed: float,
+    dummy_beta: float,
+    reference_density: float,
     # output
     accel: wp.array(dtype=wp.vec3),
 ):
@@ -321,9 +366,13 @@ def compute_artificial_viscosity_kernel(
         \\Pi_{ij} = \\frac{-\\alpha \\, c_s \\, \\mu_{ij}}{\\bar{\\rho}_{ij}},
         \\quad \\mu_{ij} = \\frac{h \\, \\mathbf{v}_{ij} \\cdot \\mathbf{x}_{ij}}
         {|\\mathbf{x}_{ij}|^2 + \\epsilon h^2}
+
+    For dummy neighbors, virtual velocity and reference density are used.
     """
     i = wp.tid()
     if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if particle_type[i] != SPH_FLUID:
         return
 
     xi = pos[i]
@@ -340,10 +389,14 @@ def compute_artificial_viscosity_kernel(
             r_vec = xi - xj
             r = wp.length(r_vec)
             if r < support_radius and r > _EPSILON:
-                v_ij = vi - vel[j]
+                vj = vel[j]
+                rho_j = density[j]
+                if particle_type[j] != SPH_FLUID:
+                    vj = compute_virtual_velocity(vi, vel[j], dummy_beta, wall_normal[j], particle_type[j])
+                    rho_j = reference_density
+                v_ij = vi - vj
                 vx = wp.dot(v_ij, r_vec)
                 if vx < 0.0:
-                    rho_j = density[j]
                     rho_avg = 0.5 * (rho_i + rho_j)
                     if rho_avg > _EPSILON:
                         mu_ij = h * vx / (r * r + eta_sq)
@@ -367,9 +420,13 @@ def xsph_correction_kernel(
     mass: wp.array(dtype=float),
     density: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
+    wall_normal: wp.array(dtype=wp.vec3),
     h: float,
     support_radius: float,
     epsilon: float,
+    dummy_beta: float,
+    reference_density: float,
     # output (in-place)
     vel_out: wp.array(dtype=wp.vec3),
 ):
@@ -379,9 +436,13 @@ def xsph_correction_kernel(
         \\mathbf{v}_i^{\\text{corr}} = \\mathbf{v}_i
         + \\varepsilon \\sum_j \\frac{m_j}{\\bar{\\rho}_{ij}}
         (\\mathbf{v}_j - \\mathbf{v}_i) W_{ij}
+
+    For dummy neighbors, virtual velocity and reference density are used.
     """
     i = wp.tid()
     if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if particle_type[i] != SPH_FLUID:
         return
 
     xi = pos[i]
@@ -397,10 +458,15 @@ def xsph_correction_kernel(
             r_vec = xi - xj
             r = wp.length(r_vec)
             if r < support_radius:
-                rho_avg = 0.5 * (rho_i + density[j])
+                vj = vel[j]
+                rho_j = density[j]
+                if particle_type[j] != SPH_FLUID:
+                    vj = compute_virtual_velocity(vi, vel[j], dummy_beta, wall_normal[j], particle_type[j])
+                    rho_j = reference_density
+                rho_avg = 0.5 * (rho_i + rho_j)
                 if rho_avg > _EPSILON:
                     w = wendland_c2_3d(r, h)
-                    correction += (mass[j] / rho_avg) * (vel[j] - vi) * w
+                    correction += (mass[j] / rho_avg) * (vj - vi) * w
 
     vel_out[i] = vi + epsilon * correction
 
@@ -416,6 +482,7 @@ def integrate_symplectic_euler_kernel(
     vel_in: wp.array(dtype=wp.vec3),
     accel: wp.array(dtype=wp.vec3),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
     particle_world: wp.array(dtype=wp.int32),
     gravity: wp.array(dtype=wp.vec3),
     dt: float,
@@ -429,11 +496,13 @@ def integrate_symplectic_euler_kernel(
     .. math::
         \\mathbf{v}^{n+1} = \\mathbf{v}^n + (\\mathbf{a} + \\mathbf{g}) \\Delta t, \\quad
         \\mathbf{x}^{n+1} = \\mathbf{x}^n + \\mathbf{v}^{n+1} \\Delta t
+
+    Dummy particles (``particle_type != 0``) are kept static.
     """
     i = wp.tid()
     x0 = pos_in[i]
 
-    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0 or particle_type[i] != SPH_FLUID:
         pos_out[i] = x0
         vel_out[i] = vel_in[i]
         return
