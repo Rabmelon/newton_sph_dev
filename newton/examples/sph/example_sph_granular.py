@@ -8,11 +8,6 @@ gravity using the SPH solver with a Drucker-Prager elastic-plastic
 constitutive model.  Particles are initialized on a regular grid
 (voxelization) filtered by the cylinder geometry.
 
-Usage::
-
-    python -m newton.examples sph_granular
-    python -m newton.examples sph_granular --simulation-method mui
-    python -m newton.examples sph_granular --boundary-type penalty
 """
 
 import numpy as np
@@ -27,7 +22,18 @@ class Example:
         self.fps = args.fps
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = args.substeps
+        # Simulation duration (seconds)
+        self.sim_duration = args.duration
+        # How to behave when the simulation ends
+        self.end_behavior = args.end_behavior
+        # Compute CFL-stable substep count automatically when not overridden.
+        # dt_CFL = 0.3 * h / c_s;  h = kh * dx.
+        if args.substeps is None:
+            h = args.kh * args.particle_spacing
+            dt_cfl = 0.3 * h / args.sound_speed
+            self.sim_substeps = max(1, int(np.ceil(self.frame_dt / dt_cfl)))
+        else:
+            self.sim_substeps = args.substeps
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer
@@ -57,6 +63,9 @@ class Example:
         self.model.set_gravity(args.gravity)
 
         config = SolverSPH.Config()
+        # --smoothing-length overrides particle_spacing when provided (test convenience).
+        if args.smoothing_length is not None:
+            args.particle_spacing = args.smoothing_length
         config.particle_spacing = args.particle_spacing
         config.kh = args.kh
         config.reference_density = args.density
@@ -88,6 +97,9 @@ class Example:
         self.show_stress = False
 
     def simulate(self):
+        # Skip stepping if we've already reached the requested duration
+        if self.sim_time >= self.sim_duration:
+            return
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
@@ -96,6 +108,19 @@ class Example:
     def step(self):
         self.simulate()
         self.sim_time += self.frame_dt
+        # Print simulation progress to the command line
+        print(f"sim step: {getattr(self, 'step_count', 0)}, time: {self.sim_time:.6f}s", flush=True)
+
+        # Check if we've reached or exceeded the target duration
+        if self.sim_time >= self.sim_duration:
+            if self.end_behavior == "exit":
+                # Signal the examples runner to quit if it supports this pattern
+                if hasattr(self.viewer, "should_close"):
+                    self.viewer.should_close = True
+
+        # Additionally stop the simulation once 0.1 seconds of simulated time is reached
+        if self.sim_time >= 0.1:
+            raise SystemExit("Reached 0.1s of simulated time, stopping simulation.")
 
     def test_final(self):
         h = self.solver.smoothing_length
@@ -161,7 +186,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
 
-        # Scene — cylindrical column geometry
+        # Scene
         parser.add_argument("--cylinder-radius", type=float, default=0.1)
         parser.add_argument("--cylinder-height", type=float, default=0.2)
         parser.add_argument("--cylinder-base", type=float, nargs=3, default=[0.0, 0.0, 0.0])
@@ -169,16 +194,26 @@ class Example:
         parser.add_argument("--domain-hi", type=float, nargs=3, default=[1.0, 1.0, 0.3])
         parser.add_argument("--gravity", type=float, nargs=3, default=[0, 0, -9.81])
         parser.add_argument("--fps", type=float, default=60.0)
-        parser.add_argument("--substeps", type=int, default=4)
+        # Substeps: auto-computed from CFL condition when not set.
+        # dt_CFL = 0.3 * h / c_s (e.g. ≈ 0.039 ms for default dx=0.005, c_s=50).
+        parser.add_argument("--substeps", type=int, default=None)
+        # Simulation duration and end-of-run behavior
+        parser.add_argument("--duration", type=float, default=0.1, help="Simulation duration in seconds")
+        parser.add_argument("--end-behavior", type=str, default="exit", choices=["pause", "exit"],
+            help=("What to do when the simulation reaches the specified duration: "
+                    "'pause' keeps the GUI open, 'exit' closes the simulation window."),
+        )
 
         # SPH
         parser.add_argument("--particle-spacing", "-dx", type=float, default=0.005)
+        # --smoothing-length is a convenience alias for particle-spacing (same unit, [m]).
+        parser.add_argument("--smoothing-length", type=float, default=None)
         parser.add_argument("--kh", type=float, default=1.3)
         parser.add_argument("--simulation-method", type=str, default="dp", choices=["dp", "mui"])
         parser.add_argument("--sound-speed", type=float, default=50.0)
         parser.add_argument("--artificial-viscosity-alpha", type=float, default=0.1)
+        parser.add_argument("--boundary-type", type=str, default="penalty", choices=["penalty", "dummy"])
         parser.add_argument("--penalty-stiffness", type=float, default=1.0e6)
-        parser.add_argument("--boundary-type", type=str, default="dummy", choices=["penalty", "dummy"])
         parser.add_argument("--dummy-slip-type", type=str, default="noslip", choices=["noslip", "freeslip"])
 
         # Material
@@ -194,7 +229,17 @@ class Example:
 
 
 if __name__ == "__main__":
+    import time
+
+    # Measure total wall-clock time for initialization + simulation run
+    _t_start = time.perf_counter()
+
     parser = Example.create_parser()
     viewer, args = newton.examples.init(parser)
     example = Example(viewer, args)
-    newton.examples.run(example, args)
+
+    try:
+        newton.examples.run(example, args)
+    finally:
+        _t_end = time.perf_counter()
+        print(f"Total wall time (compile + run): {_t_end - _t_start:.6f}s", flush=True)

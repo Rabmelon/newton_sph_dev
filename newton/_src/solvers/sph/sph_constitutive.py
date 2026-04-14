@@ -256,6 +256,7 @@ def update_stress_mui_kernel(
     reference_density: float,
     sound_speed: float,
     eos_gamma: float,
+    smoothing_length: float,
     # output
     stress_out: wp.array(dtype=wp.mat33),
     pressure_out: wp.array(dtype=float),
@@ -307,10 +308,14 @@ def update_stress_mui_kernel(
     tan_phi = wp.tan(phi)
     eta = (c + P * tan_phi) / wp.max(D_equ, _EPSILON)
 
-    # Clamp viscosity to a maximum value to avoid numerical explosion
+    # Clamp viscosity to avoid numerical explosion when D_equ → 0 (particles at
+    # rest).  User-specified cap takes priority; otherwise fall back to a
+    # physically motivated upper bound: eta_max = rho_0 * c_s * h, which is the
+    # same order as the artificial-viscosity dissipation scale.
     max_visc = viscosity[i]
-    if max_visc > 0.0:
-        eta = wp.min(eta, max_visc)
+    if max_visc <= 0.0:
+        max_visc = reference_density * sound_speed * smoothing_length
+    eta = wp.min(eta, max_visc)
 
     # Stress: sigma = 2 * eta * D_dev - P * I
     sigma = 2.0 * eta * D_dev - P * eye

@@ -24,7 +24,11 @@ class Example:
         self.fps = 60.0
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 4
+        # Auto-compute CFL-stable substeps: dt_CFL = 0.3 * h / c_s.
+        # smoothing_length is used as h; default sound_speed = 50 m/s.
+        _sound_speed = 50.0
+        _dt_cfl = 0.3 * args.smoothing_length / _sound_speed
+        self.sim_substeps = max(1, int(np.ceil(self.frame_dt / _dt_cfl)))
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer

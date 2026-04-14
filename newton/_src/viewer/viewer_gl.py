@@ -214,8 +214,8 @@ class ViewerGL(ViewerBase):
         fb_w, fb_h = self.renderer.window.get_framebuffer_size()
         self.camera = Camera(width=fb_w, height=fb_h, up_axis="Z")
 
-        # self._paused = False
-        self._paused = True
+        self._paused = False
+        # self._paused = True
 
         # Selection panel state
         self._selection_ui_state = {
@@ -241,7 +241,7 @@ class ViewerGL(ViewerBase):
         self.renderer.register_resize(self.on_resize)
 
         # Camera movement settings
-        self._camera_speed = 0.04
+        self._camera_speed = 0.02
         self._cam_vel = np.zeros(3, dtype=np.float32)
         self._cam_speed = 4.0  # m/s
         self._cam_damp_tau = 0.083  # s

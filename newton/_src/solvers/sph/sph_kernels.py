@@ -516,6 +516,14 @@ def integrate_symplectic_euler_kernel(
     # v1 = v0 + (a + g) * dt
     v1 = v0 + (a + g) * dt
 
+    # Guard against NaN/Inf from upstream stress or density errors.  A NaN
+    # velocity would silently propagate and corrupt the entire simulation;
+    # zeroing the affected particle keeps it recoverable.
+    if wp.isnan(v1[0]) or wp.isnan(v1[1]) or wp.isnan(v1[2]) or wp.isinf(v1[0]) or wp.isinf(v1[1]) or wp.isinf(
+        v1[2]
+    ):
+        v1 = wp.vec3(0.0)
+
     # enforce velocity limit
     v1_mag = wp.length(v1)
     if v1_mag > v_max:

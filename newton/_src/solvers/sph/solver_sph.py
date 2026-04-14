@@ -23,14 +23,16 @@ References:
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
+import numpy as np
 import warp as wp
 
 import newton
 
 from ..solver import SolverBase
-from .sph_boundary import apply_ground_plane_penalty
+from .sph_boundary import ground_plane_penalty_kernel
 from .sph_constitutive import (
     initialize_geostatic_stress_kernel,
     update_stress_dp_kernel,
@@ -45,7 +47,6 @@ from .sph_kernels import (
     compute_velocity_gradient_kernel,
     integrate_symplectic_euler_kernel,
     xsph_correction_kernel,
-    zero_accel_kernel,
 )
 from .sph_model import SPHModel
 
@@ -265,6 +266,61 @@ class SolverSPH(SolverBase):
         self._particle_type = model.sph.particle_type
         self._wall_normal = model.sph.wall_normal
 
+        # Static CFL limit (velocity-independent; used for one-time warning).
+        self._dt_cfl_static = 0.3 * self._h / config.sound_speed
+        self._cfl_warned = False
+        self._gravity_vec = self._extract_gravity_vec()
+
+        # Cache ground plane data for penalty boundary to avoid GPU→CPU sync
+        # in the hot loop (apply_ground_plane_penalty reads shape arrays every call).
+        if config.boundary_type == "penalty":
+            self._ground_planes = self._extract_ground_planes()
+
+        # Compute fluid particle count for optimized kernel launches.
+        # Fluid particles must be contiguous at the front of the array
+        # (guaranteed when add_dummy_particles is called after fluid emission).
+        pt = self._particle_type.numpy()
+        self._fluid_count = int(np.sum(pt == 0))
+        if 0 < self._fluid_count < n:
+            if not np.all(pt[:self._fluid_count] == 0):
+                warnings.warn(
+                    "Fluid particles are not contiguous at the front of the particle "
+                    "array. Falling back to launching kernels with dim=particle_count.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._fluid_count = n
+
+    def _extract_gravity_vec(self) -> wp.vec3:
+        """Extract gravity as a :class:`wp.vec3` from the model array."""
+        g = self.model.gravity.numpy()
+        return wp.vec3(float(g[0][0]), float(g[0][1]), float(g[0][2]))
+
+    def _extract_ground_planes(self) -> list[tuple[wp.vec3, float]]:
+        """Pre-compute ground plane normals and offsets from model shapes.
+
+        Reads shape geometry arrays once so that the hot loop can launch
+        penalty kernels without GPU→CPU synchronization.
+        """
+        from ...geometry import GeoType
+
+        model = self.model
+        if model.shape_count == 0:
+            return []
+        geo_types = model.shape_type.numpy()
+        shape_transforms = model.shape_transform.numpy()
+        planes: list[tuple[wp.vec3, float]] = []
+        for s in range(model.shape_count):
+            if geo_types[s] == int(GeoType.PLANE):
+                tf = shape_transforms[s]
+                px, py, pz = float(tf[0]), float(tf[1]), float(tf[2])
+                qx, qy, qz, qw = float(tf[3]), float(tf[4]), float(tf[5]), float(tf[6])
+                q = wp.quat(qx, qy, qz, qw)
+                normal = wp.quat_rotate(q, wp.vec3(0.0, 0.0, 1.0))
+                offset = -(normal[0] * px + normal[1] * py + normal[2] * pz)
+                planes.append((normal, float(offset)))
+        return planes
+
     @property
     def config(self) -> Config:
         """Current solver configuration."""
@@ -274,6 +330,15 @@ class SolverSPH(SolverBase):
     def smoothing_length(self) -> float:
         """SPH smoothing length h [m]."""
         return self._h
+
+    def notify_model_changed(self, flags: int) -> None:
+        from newton.solvers import SolverNotifyFlags
+
+        if flags & SolverNotifyFlags.MODEL_PROPERTIES:
+            self._gravity_vec = self._extract_gravity_vec()
+        if flags & SolverNotifyFlags.SHAPE_PROPERTIES:
+            if self._config.boundary_type == "penalty":
+                self._ground_planes = self._extract_ground_planes()
 
     # ------------------------------------------------------------------
     # Main simulation step
@@ -301,6 +366,19 @@ class SolverSPH(SolverBase):
         if n == 0:
             return
 
+        # CFL safety check — fire once using the static (v=0) limit to avoid a
+        # GPU→CPU sync every step.  compute_cfl_dt() gives a tighter bound when
+        # called explicitly by the user.
+        if not self._cfl_warned and dt > self._dt_cfl_static * 2.0:
+            warnings.warn(
+                f"SPH dt={dt:.3e} s exceeds acoustic CFL limit "
+                f"{self._dt_cfl_static:.3e} s (ratio={dt / self._dt_cfl_static:.1f}×). "
+                "Reduce sim_dt or increase substeps to avoid particle explosion.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._cfl_warned = True
+
         with wp.ScopedDevice(model.device):
             # 1. Build neighbor list
             self._build_neighbor_list(state_in)
@@ -308,8 +386,8 @@ class SolverSPH(SolverBase):
             # 2. Compute density (stored on state_in for use during force computation)
             self._compute_density(state_in)
 
-            # 3. Zero acceleration
-            wp.launch(zero_accel_kernel, dim=n, inputs=[], outputs=[self._accel], device=model.device)
+            # 3. Zero acceleration (cudaMemset is cheaper than a kernel launch)
+            self._accel.zero_()
 
             # 4-6. Compute forces based on constitutive model
             # Stress is read from state_in (previous) and written to state_out (new).
@@ -357,7 +435,7 @@ class SolverSPH(SolverBase):
         n = self.model.particle_count
         wp.launch(
             compute_density_kernel,
-            dim=n,
+            dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
                 state.particle_q,
@@ -376,7 +454,7 @@ class SolverSPH(SolverBase):
         n = self.model.particle_count
         wp.launch(
             compute_velocity_gradient_kernel,
-            dim=n,
+            dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
                 state.particle_q,
@@ -400,7 +478,7 @@ class SolverSPH(SolverBase):
         n = self.model.particle_count
         wp.launch(
             compute_strain_rate_kernel,
-            dim=n,
+            dim=self._fluid_count,
             inputs=[
                 state.sph.velocity_gradient,
                 self.model.particle_flags,
@@ -419,7 +497,7 @@ class SolverSPH(SolverBase):
         wp.copy(state_out.sph.plastic_strain, state_in.sph.plastic_strain)
         wp.launch(
             update_stress_dp_kernel,
-            dim=n,
+            dim=self._fluid_count,
             inputs=[
                 state_in.sph.strain_rate,
                 state_in.sph.stress,
@@ -448,7 +526,7 @@ class SolverSPH(SolverBase):
         n = self.model.particle_count
         wp.launch(
             update_stress_mui_kernel,
-            dim=n,
+            dim=self._fluid_count,
             inputs=[
                 state_in.sph.strain_rate,
                 state_in.sph.density,
@@ -460,6 +538,7 @@ class SolverSPH(SolverBase):
                 self._config.reference_density,
                 self._config.sound_speed,
                 self._config.eos_exponent,
+                self._h,
             ],
             outputs=[
                 state_out.sph.stress,
@@ -474,11 +553,10 @@ class SolverSPH(SolverBase):
         Uses density from state_in and updated stress from state_out.
         """
         n = self.model.particle_count
-        gravity_np = self.model.gravity.numpy()
-        gravity_vec = wp.vec3(float(gravity_np[0][0]), float(gravity_np[0][1]), float(gravity_np[0][2]))
+        gravity_vec = self._gravity_vec
         wp.launch(
             compute_stress_force_kernel,
-            dim=n,
+            dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
                 state_in.particle_q,
@@ -501,7 +579,7 @@ class SolverSPH(SolverBase):
         n = self.model.particle_count
         wp.launch(
             compute_artificial_viscosity_kernel,
-            dim=n,
+            dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
                 state.particle_q,
@@ -523,14 +601,28 @@ class SolverSPH(SolverBase):
         )
 
     def _apply_boundary_forces(self, state: newton.State) -> None:
-        """Apply boundary penalty forces from ground planes and collider shapes."""
-        apply_ground_plane_penalty(
-            self.model,
-            state,
-            self._accel,
-            self._config.penalty_stiffness,
-            self._config.penalty_damping,
-        )
+        """Apply cached ground plane penalty forces.
+
+        Uses pre-computed plane normals and offsets from :meth:`__init__`
+        to avoid GPU→CPU synchronization every substep.
+        """
+        n = self.model.particle_count
+        for normal, offset in self._ground_planes:
+            wp.launch(
+                ground_plane_penalty_kernel,
+                dim=n,
+                inputs=[
+                    state.particle_q,
+                    state.particle_qd,
+                    self.model.particle_flags,
+                    normal,
+                    offset,
+                    self._config.penalty_stiffness,
+                    self._config.penalty_damping,
+                ],
+                outputs=[self._accel],
+                device=self.model.device,
+            )
 
     def _integrate(self, state_in: newton.State, state_out: newton.State, dt: float) -> None:
         """Symplectic Euler time integration."""
@@ -559,7 +651,7 @@ class SolverSPH(SolverBase):
         n = self.model.particle_count
         wp.launch(
             xsph_correction_kernel,
-            dim=n,
+            dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
                 state.particle_q,
@@ -626,3 +718,25 @@ class SolverSPH(SolverBase):
             outputs=[state.sph.stress],
             device=self.model.device,
         )
+
+    # ------------------------------------------------------------------
+    # CFL diagnostics
+    # ------------------------------------------------------------------
+
+    def compute_cfl_dt(self, state: newton.State, courant_number: float = 0.3) -> float:
+        """Return the acoustic CFL-stable timestep for the current state.
+
+        .. math::
+            \\Delta t_{\\text{CFL}} = C \\frac{h}{c_s + \\|\\mathbf{v}\\|_{\\max}}
+
+        Args:
+            state: Current simulation state used to obtain the maximum
+                particle velocity magnitude.
+            courant_number: Courant safety factor *C* (default 0.3).
+
+        Returns:
+            Maximum stable timestep [s].
+        """
+        v_np = state.particle_qd.numpy()
+        v_max = float(np.linalg.norm(v_np, axis=-1).max()) if len(v_np) else 0.0
+        return courant_number * self._h / (self._config.sound_speed + v_max)
