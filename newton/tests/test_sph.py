@@ -328,6 +328,80 @@ def test_sand_cube_dummy_boundary(test, device):
     )
 
 
+def test_sand_cube_position_verlet(test, device):
+    """Sand cube with Position-based Verlet integration should collapse and stay above ground."""
+
+    N = 4
+    particles_per_cell = 3
+    smoothing_length = 0.15
+    particle_spacing = smoothing_length / particles_per_cell
+    dt = 0.001
+
+    builder = newton.ModelBuilder()
+    SolverSPH.register_custom_attributes(builder)
+
+    builder.add_particle_grid(
+        pos=wp.vec3(0.5 * particle_spacing),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=N * particles_per_cell,
+        dim_y=N * particles_per_cell,
+        dim_z=N * particles_per_cell,
+        cell_x=particle_spacing,
+        cell_y=particle_spacing,
+        cell_z=particle_spacing,
+        mass=0.1,
+        jitter=0.0,
+        custom_attributes={"sph:friction": 0.5},
+    )
+    builder.add_ground_plane()
+
+    model = builder.finalize(device=device)
+
+    config = SolverSPH.Config()
+    config.smoothing_length = smoothing_length
+    config.reference_density = 2500.0
+    config.xsph_epsilon = 0.0
+    config.integration_scheme = "position_verlet"
+
+    state_0 = model.state()
+    state_1 = model.state()
+
+    solver = SolverSPH(model, config)
+
+    init_pos = state_0.particle_q.numpy()
+    init_z_max = np.max(init_pos[:, 2])
+
+    for _ in range(100):
+        solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+        state_0, state_1 = state_1, state_0
+
+    final_pos = state_0.particle_q.numpy()
+    final_vel = state_0.particle_qd.numpy()
+    final_z_min = np.min(final_pos[:, 2])
+    final_z_max = np.max(final_pos[:, 2])
+
+    # No NaN/Inf in final positions or velocities
+    test.assertFalse(np.any(np.isnan(final_pos)), "NaN detected in final positions")
+    test.assertFalse(np.any(np.isinf(final_pos)), "Inf detected in final positions")
+    test.assertFalse(np.any(np.isnan(final_vel)), "NaN detected in final velocities")
+    test.assertFalse(np.any(np.isinf(final_vel)), "Inf detected in final velocities")
+
+    # Particles should stay above ground
+    test.assertGreater(
+        final_z_min,
+        -smoothing_length,
+        f"Particles penetrated ground: min z = {final_z_min:.4f}",
+    )
+
+    # Column should have collapsed (max height decreased)
+    test.assertLess(
+        final_z_max,
+        init_z_max,
+        "Column did not collapse under gravity",
+    )
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -349,6 +423,13 @@ add_function_test(
 )
 add_function_test(
     TestSPH, "test_sand_cube_dummy_boundary", test_sand_cube_dummy_boundary, devices=devices, check_output=False
+)
+add_function_test(
+    TestSPH,
+    "test_sand_cube_position_verlet",
+    test_sand_cube_position_verlet,
+    devices=devices,
+    check_output=False,
 )
 
 

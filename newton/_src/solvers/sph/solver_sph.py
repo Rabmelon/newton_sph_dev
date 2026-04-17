@@ -45,7 +45,9 @@ from .sph_kernels import (
     compute_strain_rate_kernel,
     compute_stress_force_kernel,
     compute_velocity_gradient_kernel,
+    half_step_position_kernel,
     integrate_symplectic_euler_kernel,
+    integrate_verlet_final_kernel,
     xsph_correction_kernel,
 )
 from .sph_model import SPHModel
@@ -93,7 +95,7 @@ class SolverSPH(SolverBase):
 
         # --- Time integration ---
         integration_scheme: str = "symplectic_euler"
-        """Time integration: ``'symplectic_euler'`` or ``'leapfrog'``."""
+        """Time integration: ``'symplectic_euler'`` or ``'position_verlet'``."""
 
         # --- Neighbor search ---
         hash_grid_dim: int = 128
@@ -262,6 +264,10 @@ class SolverSPH(SolverBase):
         n = model.particle_count
         self._accel = wp.zeros(n, dtype=wp.vec3, device=model.device)
 
+        # Midpoint position buffer for Position-based Verlet integration
+        if config.integration_scheme == "position_verlet":
+            self._pos_mid = wp.zeros(n, dtype=wp.vec3, device=model.device)
+
         # Cached references for dummy boundary kernel args
         self._particle_type = model.sph.particle_type
         self._wall_normal = model.sph.wall_normal
@@ -380,65 +386,164 @@ class SolverSPH(SolverBase):
             self._cfl_warned = True
 
         with wp.ScopedDevice(model.device):
-            # 1. Build neighbor list
-            self._build_neighbor_list(state_in)
+            if self._config.integration_scheme == "position_verlet":
+                self._step_position_verlet(state_in, state_out, dt)
+            else:
+                self._step_symplectic_euler(state_in, state_out, dt)
 
-            # 2. Compute density (stored on state_in for use during force computation)
-            self._compute_density(state_in)
+    def _step_symplectic_euler(self, state_in: newton.State, state_out: newton.State, dt: float) -> None:
+        """Symplectic (semi-implicit) Euler time integration step."""
+        # 1. Build neighbor list
+        self._build_neighbor_list(state_in)
 
-            # 3. Zero acceleration (cudaMemset is cheaper than a kernel launch)
-            self._accel.zero_()
+        # 2. Compute density (stored on state_in for use during force computation)
+        self._compute_density(state_in)
 
-            # 4-6. Compute forces based on constitutive model
-            # Stress is read from state_in (previous) and written to state_out (new).
-            # Force computation then uses the updated stress from state_out.
-            if self._config.simulation_method == "dp":
-                self._compute_velocity_gradient(state_in)
-                self._compute_strain_rate(state_in)
-                self._compute_stress_dp(state_in, state_out, dt)
-                self._compute_stress_forces(state_in, state_out)
-            elif self._config.simulation_method == "mui":
-                self._compute_velocity_gradient(state_in)
-                self._compute_strain_rate(state_in)
-                self._compute_stress_mui(state_in, state_out, dt)
-                self._compute_stress_forces(state_in, state_out)
+        # 3. Zero acceleration (cudaMemset is cheaper than a kernel launch)
+        self._accel.zero_()
 
-            # 7. Artificial viscosity
-            if self._config.artificial_viscosity_alpha > 0.0:
-                self._compute_artificial_viscosity(state_in)
+        # 4-6. Compute forces based on constitutive model
+        # Stress is read from state_in (previous) and written to state_out (new).
+        # Force computation then uses the updated stress from state_out.
+        if self._config.simulation_method == "dp":
+            self._compute_velocity_gradient(state_in)
+            self._compute_strain_rate(state_in)
+            self._compute_stress_dp(state_in, state_out, dt)
+            self._compute_stress_forces(state_in, state_out)
+        elif self._config.simulation_method == "mui":
+            self._compute_velocity_gradient(state_in)
+            self._compute_strain_rate(state_in)
+            self._compute_stress_mui(state_in, state_out, dt)
+            self._compute_stress_forces(state_in, state_out)
 
-            # 8. Boundary forces (penalty method only; dummy particles
-            #    handle boundaries through the SPH kernels themselves)
-            if self._config.boundary_type == "penalty":
-                self._apply_boundary_forces(state_in)
+        # 7. Artificial viscosity
+        if self._config.artificial_viscosity_alpha > 0.0:
+            self._compute_artificial_viscosity(state_in)
 
-            # 9. Time integration (symplectic Euler, includes gravity)
-            self._integrate(state_in, state_out, dt)
+        # 8. Boundary forces (penalty method only; dummy particles
+        #    handle boundaries through the SPH kernels themselves)
+        if self._config.boundary_type == "penalty":
+            self._apply_boundary_forces(state_in)
 
-            # 10. XSPH velocity correction
-            if self._config.xsph_epsilon > 0.0:
-                self._xsph_correction(state_out)
+        # 9. Time integration (symplectic Euler, includes gravity)
+        self._integrate(state_in, state_out, dt)
 
-            # 11. Copy density to state_out for continuity across steps
-            wp.copy(state_out.sph.density, state_in.sph.density)
+        # 10. XSPH velocity correction
+        if self._config.xsph_epsilon > 0.0:
+            self._xsph_correction(state_out)
+
+        # 11. Copy density to state_out for continuity across steps
+        wp.copy(state_out.sph.density, state_in.sph.density)
+
+    def _step_position_verlet(self, state_in: newton.State, state_out: newton.State, dt: float) -> None:
+        """Position-based Verlet (2nd order) time integration step.
+
+        Reference:
+            Zhang et al. (2024) Computers and Geotechnics 167:106052.
+        """
+        model = self.model
+        n = model.particle_count
+
+        # 1. Half-step position: x_mid = x_n + (dt/2) * v_n
+        wp.launch(
+            half_step_position_kernel,
+            dim=n,
+            inputs=[
+                state_in.particle_q,
+                state_in.particle_qd,
+                model.particle_flags,
+                self._particle_type,
+                dt * 0.5,
+            ],
+            outputs=[self._pos_mid],
+            device=model.device,
+        )
+
+        # 2. Build neighbor list at midpoint positions
+        self._build_neighbor_list(state_in, pos=self._pos_mid)
+
+        # 3. Compute density at midpoint -> write to state_out
+        self._compute_density(state_out, pos=self._pos_mid)
+
+        # 4. Zero acceleration
+        self._accel.zero_()
+
+        # 5-6. Compute forces at midpoint configuration
+        if self._config.simulation_method == "dp":
+            self._compute_velocity_gradient(state_out, pos=self._pos_mid, vel=state_in.particle_qd)
+            self._compute_strain_rate(state_out)
+            self._compute_stress_dp(state_in, state_out, dt, strain_rate=state_out.sph.strain_rate)
+            self._compute_stress_forces(state_in, state_out, pos=self._pos_mid, density=state_out.sph.density)
+        elif self._config.simulation_method == "mui":
+            self._compute_velocity_gradient(state_out, pos=self._pos_mid, vel=state_in.particle_qd)
+            self._compute_strain_rate(state_out)
+            self._compute_stress_mui(
+                state_in,
+                state_out,
+                dt,
+                strain_rate=state_out.sph.strain_rate,
+                density=state_out.sph.density,
+            )
+            self._compute_stress_forces(state_in, state_out, pos=self._pos_mid, density=state_out.sph.density)
+
+        # 7. Artificial viscosity at midpoint
+        if self._config.artificial_viscosity_alpha > 0.0:
+            self._compute_artificial_viscosity(
+                state_in, pos=self._pos_mid, vel=state_in.particle_qd, density=state_out.sph.density
+            )
+
+        # 8. Boundary forces at midpoint
+        if self._config.boundary_type == "penalty":
+            self._apply_boundary_forces(state_in, pos=self._pos_mid, vel=state_in.particle_qd)
+
+        # 9. Full-step velocity + final position
+        self._integrate_verlet_final(state_in, state_out, dt)
+
+        # 10. XSPH velocity correction (uses midpoint hash grid)
+        if self._config.xsph_epsilon > 0.0:
+            self._xsph_correction(state_out)
+
+        # Density was computed directly into state_out in step 3 — no copy needed.
+
+    def _integrate_verlet_final(self, state_in: newton.State, state_out: newton.State, dt: float) -> None:
+        """Verlet final step: full-step velocity and position from midpoint."""
+        model = self.model
+        wp.launch(
+            integrate_verlet_final_kernel,
+            dim=model.particle_count,
+            inputs=[
+                self._pos_mid,
+                state_in.particle_qd,
+                self._accel,
+                model.particle_flags,
+                self._particle_type,
+                model.particle_world,
+                model.gravity,
+                dt,
+                model.particle_max_velocity,
+            ],
+            outputs=[state_out.particle_q, state_out.particle_qd],
+            device=model.device,
+        )
 
     # ------------------------------------------------------------------
     # Internal methods
     # ------------------------------------------------------------------
 
-    def _build_neighbor_list(self, state: newton.State) -> None:
+    def _build_neighbor_list(self, state: newton.State, *, pos: wp.array[wp.vec3] | None = None) -> None:
         """Build hash grid from current particle positions."""
-        self._hash_grid.build(state.particle_q, self._support_radius)
+        positions = pos if pos is not None else state.particle_q
+        self._hash_grid.build(positions, self._support_radius)
 
-    def _compute_density(self, state: newton.State) -> None:
+    def _compute_density(self, state: newton.State, *, pos: wp.array[wp.vec3] | None = None) -> None:
         """Compute SPH density via direct summation."""
-        n = self.model.particle_count
+        positions = pos if pos is not None else state.particle_q
         wp.launch(
             compute_density_kernel,
             dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
-                state.particle_q,
+                positions,
                 self.model.particle_mass,
                 self.model.particle_flags,
                 self._particle_type,
@@ -449,16 +554,23 @@ class SolverSPH(SolverBase):
             device=self.model.device,
         )
 
-    def _compute_velocity_gradient(self, state: newton.State) -> None:
+    def _compute_velocity_gradient(
+        self,
+        state: newton.State,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+        vel: wp.array[wp.vec3] | None = None,
+    ) -> None:
         """Compute SPH velocity gradient tensor."""
-        n = self.model.particle_count
+        positions = pos if pos is not None else state.particle_q
+        velocities = vel if vel is not None else state.particle_qd
         wp.launch(
             compute_velocity_gradient_kernel,
             dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
-                state.particle_q,
-                state.particle_qd,
+                positions,
+                velocities,
                 self.model.particle_mass,
                 state.sph.density,
                 self.model.particle_flags,
@@ -487,19 +599,26 @@ class SolverSPH(SolverBase):
             device=self.model.device,
         )
 
-    def _compute_stress_dp(self, state_in: newton.State, state_out: newton.State, dt: float) -> None:
+    def _compute_stress_dp(
+        self,
+        state_in: newton.State,
+        state_out: newton.State,
+        dt: float,
+        *,
+        strain_rate: wp.array[wp.mat33] | None = None,
+    ) -> None:
         """Compute stress via Drucker-Prager elastic-plastic model.
 
         Reads previous stress from state_in, writes new stress to state_out.
         """
-        n = self.model.particle_count
+        sr = strain_rate if strain_rate is not None else state_in.sph.strain_rate
         # Copy plastic_strain from state_in to state_out for accumulation
         wp.copy(state_out.sph.plastic_strain, state_in.sph.plastic_strain)
         wp.launch(
             update_stress_dp_kernel,
             dim=self._fluid_count,
             inputs=[
-                state_in.sph.strain_rate,
+                sr,
                 state_in.sph.stress,
                 self.model.sph.young_modulus,
                 self.model.sph.poisson_ratio,
@@ -518,18 +637,27 @@ class SolverSPH(SolverBase):
             device=self.model.device,
         )
 
-    def _compute_stress_mui(self, state_in: newton.State, state_out: newton.State, dt: float) -> None:
+    def _compute_stress_mui(
+        self,
+        state_in: newton.State,
+        state_out: newton.State,
+        dt: float,
+        *,
+        strain_rate: wp.array[wp.mat33] | None = None,
+        density: wp.array[float] | None = None,
+    ) -> None:
         """Compute stress via mu(I) rheology model.
 
         Reads strain rate from state_in, writes new stress to state_out.
         """
-        n = self.model.particle_count
+        sr = strain_rate if strain_rate is not None else state_in.sph.strain_rate
+        rho = density if density is not None else state_in.sph.density
         wp.launch(
             update_stress_mui_kernel,
             dim=self._fluid_count,
             inputs=[
-                state_in.sph.strain_rate,
-                state_in.sph.density,
+                sr,
+                rho,
                 self.model.sph.friction,
                 self.model.sph.cohesion,
                 self.model.sph.viscosity,
@@ -547,21 +675,29 @@ class SolverSPH(SolverBase):
             device=self.model.device,
         )
 
-    def _compute_stress_forces(self, state_in: newton.State, state_out: newton.State) -> None:
+    def _compute_stress_forces(
+        self,
+        state_in: newton.State,
+        state_out: newton.State,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+        density: wp.array[float] | None = None,
+    ) -> None:
         """Compute acceleration from stress tensor divergence.
 
         Uses density from state_in and updated stress from state_out.
         """
-        n = self.model.particle_count
+        positions = pos if pos is not None else state_in.particle_q
+        rho = density if density is not None else state_in.sph.density
         gravity_vec = self._gravity_vec
         wp.launch(
             compute_stress_force_kernel,
             dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
-                state_in.particle_q,
+                positions,
                 self.model.particle_mass,
-                state_in.sph.density,
+                rho,
                 state_out.sph.stress,
                 self.model.particle_flags,
                 self._particle_type,
@@ -574,18 +710,27 @@ class SolverSPH(SolverBase):
             device=self.model.device,
         )
 
-    def _compute_artificial_viscosity(self, state: newton.State) -> None:
+    def _compute_artificial_viscosity(
+        self,
+        state: newton.State,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+        vel: wp.array[wp.vec3] | None = None,
+        density: wp.array[float] | None = None,
+    ) -> None:
         """Add Monaghan-type artificial viscosity acceleration."""
-        n = self.model.particle_count
+        positions = pos if pos is not None else state.particle_q
+        velocities = vel if vel is not None else state.particle_qd
+        rho = density if density is not None else state.sph.density
         wp.launch(
             compute_artificial_viscosity_kernel,
             dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
-                state.particle_q,
-                state.particle_qd,
+                positions,
+                velocities,
                 self.model.particle_mass,
-                state.sph.density,
+                rho,
                 self.model.particle_flags,
                 self._particle_type,
                 self._wall_normal,
@@ -600,20 +745,28 @@ class SolverSPH(SolverBase):
             device=self.model.device,
         )
 
-    def _apply_boundary_forces(self, state: newton.State) -> None:
+    def _apply_boundary_forces(
+        self,
+        state: newton.State,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+        vel: wp.array[wp.vec3] | None = None,
+    ) -> None:
         """Apply cached ground plane penalty forces.
 
         Uses pre-computed plane normals and offsets from :meth:`__init__`
         to avoid GPU→CPU synchronization every substep.
         """
+        positions = pos if pos is not None else state.particle_q
+        velocities = vel if vel is not None else state.particle_qd
         n = self.model.particle_count
         for normal, offset in self._ground_planes:
             wp.launch(
                 ground_plane_penalty_kernel,
                 dim=n,
                 inputs=[
-                    state.particle_q,
-                    state.particle_qd,
+                    positions,
+                    velocities,
                     self.model.particle_flags,
                     normal,
                     offset,

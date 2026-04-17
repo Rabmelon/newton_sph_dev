@@ -537,6 +537,95 @@ def integrate_symplectic_euler_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Position-based Verlet integration kernels
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def half_step_position_kernel(
+    pos_in: wp.array(dtype=wp.vec3),
+    vel_in: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
+    half_dt: float,
+    # output
+    pos_mid: wp.array(dtype=wp.vec3),
+):
+    """Advance position by half time step for Verlet midpoint.
+
+    .. math::
+        \\mathbf{x}^{n+1/2} = \\mathbf{x}^n + \\frac{\\Delta t}{2} \\mathbf{v}^n
+
+    Dummy particles (``particle_type != 0``) are kept static.
+    """
+    i = wp.tid()
+    x0 = pos_in[i]
+
+    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0 or particle_type[i] != SPH_FLUID:
+        pos_mid[i] = x0
+        return
+
+    pos_mid[i] = x0 + vel_in[i] * half_dt
+
+
+@wp.kernel
+def integrate_verlet_final_kernel(
+    pos_mid: wp.array(dtype=wp.vec3),
+    vel_in: wp.array(dtype=wp.vec3),
+    accel: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_type: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    gravity: wp.array(dtype=wp.vec3),
+    dt: float,
+    v_max: float,
+    # output
+    pos_out: wp.array(dtype=wp.vec3),
+    vel_out: wp.array(dtype=wp.vec3),
+):
+    """Verlet final step: full-step velocity and position from midpoint.
+
+    .. math::
+        \\mathbf{v}^{n+1} = \\mathbf{v}^n + (\\mathbf{a}^{n+1/2} + \\mathbf{g}) \\Delta t, \\quad
+        \\mathbf{x}^{n+1} = \\mathbf{x}^{n+1/2} + \\frac{\\Delta t}{2} \\mathbf{v}^{n+1}
+
+    Dummy particles (``particle_type != 0``) are kept static.
+
+    Reference:
+        Zhang et al. (2024) Computers and Geotechnics 167:106052.
+    """
+    i = wp.tid()
+    x_mid = pos_mid[i]
+
+    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0 or particle_type[i] != SPH_FLUID:
+        pos_out[i] = x_mid
+        vel_out[i] = vel_in[i]
+        return
+
+    v0 = vel_in[i]
+    a = accel[i]
+
+    world_idx = particle_world[i]
+    g = gravity[wp.max(world_idx, 0)]
+
+    v1 = v0 + (a + g) * dt
+
+    # Guard against NaN/Inf from upstream stress or density errors.
+    if wp.isnan(v1[0]) or wp.isnan(v1[1]) or wp.isnan(v1[2]) or wp.isinf(v1[0]) or wp.isinf(v1[1]) or wp.isinf(
+        v1[2]
+    ):
+        v1 = wp.vec3(0.0)
+
+    # enforce velocity limit
+    v1_mag = wp.length(v1)
+    if v1_mag > v_max:
+        v1 *= v_max / v1_mag
+
+    pos_out[i] = x_mid + v1 * (dt * 0.5)
+    vel_out[i] = v1
+
+
+# ---------------------------------------------------------------------------
 # Zero acceleration kernel
 # ---------------------------------------------------------------------------
 
