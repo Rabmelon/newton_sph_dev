@@ -37,6 +37,7 @@ def ground_plane_penalty_kernel(
     plane_offset: float,
     ke: float,
     kd: float,
+    mu_f: float,
     # output (accumulated)
     accel: wp.array(dtype=wp.vec3),
 ):
@@ -46,6 +47,10 @@ def ground_plane_penalty_kernel(
     When d < 0 (penetrating), a restoring normal force and damping are applied:
 
         f_n = (ke * |d| - kd * v_n) * n
+
+    Coulomb tangential friction opposes sliding with magnitude capped by
+    mu * |f_n|, regularized by a damping-like term to prevent chatter at
+    low sliding velocities.
 
     The force is divided by particle mass (handled externally) to produce
     acceleration.
@@ -58,6 +63,7 @@ def ground_plane_penalty_kernel(
         plane_offset: Plane offset (d in ax + by + cz + d = 0).
         ke: Penalty stiffness [N/m per unit mass -> m/s^2 per m penetration].
         kd: Penalty damping [N*s/m per unit mass].
+        mu_f: Coulomb friction coefficient.
         accel: Acceleration array (accumulated in-place).
     """
     i = wp.tid()
@@ -78,6 +84,16 @@ def ground_plane_penalty_kernel(
             f_mag = 0.0
         accel[i] = accel[i] + f_mag * plane_normal
 
+        # Coulomb tangential friction
+        if mu_f > 0.0:
+            v_t = v - wp.dot(v, plane_normal) * plane_normal
+            v_t_norm = wp.length(v_t)
+            if v_t_norm > _EPSILON:
+                f_t_mag = mu_f * f_mag
+                # Regularization: cap by damping-like term to avoid chatter
+                f_t_mag = wp.min(f_t_mag, kd * v_t_norm)
+                accel[i] = accel[i] - (f_t_mag / wp.max(v_t_norm, _EPSILON)) * v_t
+
 
 def apply_ground_plane_penalty(
     model: newton.Model,
@@ -85,6 +101,7 @@ def apply_ground_plane_penalty(
     accel: wp.array,
     ke: float,
     kd: float,
+    mu_f: float = 0.0,
 ) -> None:
     """Apply ground-plane penalty forces for all plane shapes in the model.
 
@@ -97,6 +114,7 @@ def apply_ground_plane_penalty(
         accel: Acceleration array to accumulate into.
         ke: Penalty stiffness [m/s^2 per m penetration].
         kd: Penalty damping coefficient.
+        mu_f: Coulomb friction coefficient for tangential friction.
     """
     n = model.particle_count
     if n == 0:
@@ -139,6 +157,7 @@ def apply_ground_plane_penalty(
                     plane_offset,
                     ke,
                     kd,
+                    mu_f,
                 ],
                 outputs=[accel],
                 device=model.device,

@@ -142,18 +142,26 @@ def cubic_spline_grad_3d(r_vec: wp.vec3, r: float, h: float) -> wp.vec3:
 @wp.kernel
 def compute_density_kernel(
     grid: wp.uint64,
-    pos: wp.array(dtype=wp.vec3),
-    mass: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
+    pos: wp.array[wp.vec3],
+    mass: wp.array[float],
+    density_prev: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
     h: float,
     support_radius: float,
+    reference_density: float,
     # output
-    density: wp.array(dtype=float),
+    density: wp.array[float],
 ):
-    """Compute SPH density via direct summation.
+    """Compute SPH density via Shepard-corrected direct summation.
 
-    .. math:: \\rho_i = \\sum_j m_j \\, W(|\\mathbf{x}_i - \\mathbf{x}_j|, h)
+    .. math::
+
+        \\rho_i = \\frac{\\sum_j m_j \\, W_{ij}}{\\sum_j (m_j / \\rho_j^{\\mathrm{prev}}) \\, W_{ij}}
+
+    On the first step (when ``density_prev`` is zero), the raw summation is
+    used without correction. Dummy particles use ``reference_density`` in the
+    Shepard denominator since their density is never computed.
 
     Dummy particles (``particle_type != 0``) are skipped as center particles
     but contribute as neighbors.
@@ -166,6 +174,7 @@ def compute_density_kernel(
 
     xi = pos[i]
     rho = float(0.0)
+    shepard_sum = float(0.0)
 
     query = wp.hash_grid_query(grid, xi, support_radius)
     j = int(0)
@@ -175,9 +184,20 @@ def compute_density_kernel(
             r_vec = xi - xj
             r = wp.length(r_vec)
             if r < support_radius:
-                rho += mass[j] * wendland_c2_3d(r, h)
+                W = wendland_c2_3d(r, h)
+                rho += mass[j] * W
+                rho_j_prev = density_prev[j]
+                if rho_j_prev > _EPSILON:
+                    shepard_sum += (mass[j] / rho_j_prev) * W
+                elif particle_type[j] != SPH_FLUID and reference_density > _EPSILON:
+                    # Dummy particles: use reference density for Shepard denominator
+                    shepard_sum += (mass[j] / reference_density) * W
 
-    density[i] = rho
+    # Apply Shepard correction when previous density is available
+    if shepard_sum > _EPSILON:
+        density[i] = rho / shepard_sum
+    else:
+        density[i] = rho
 
 
 # ---------------------------------------------------------------------------
@@ -188,19 +208,19 @@ def compute_density_kernel(
 @wp.kernel
 def compute_velocity_gradient_kernel(
     grid: wp.uint64,
-    pos: wp.array(dtype=wp.vec3),
-    vel: wp.array(dtype=wp.vec3),
-    mass: wp.array(dtype=float),
-    density: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
-    wall_normal: wp.array(dtype=wp.vec3),
+    pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
+    mass: wp.array[float],
+    density: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
+    wall_normal: wp.array[wp.vec3],
     h: float,
     support_radius: float,
     dummy_beta: float,
     reference_density: float,
     # output
-    velocity_gradient: wp.array(dtype=wp.mat33),
+    velocity_gradient: wp.array[wp.mat33],
 ):
     """Compute velocity gradient tensor L via SPH.
 
@@ -249,10 +269,10 @@ def compute_velocity_gradient_kernel(
 
 @wp.kernel
 def compute_strain_rate_kernel(
-    velocity_gradient: wp.array(dtype=wp.mat33),
-    particle_flags: wp.array(dtype=wp.int32),
+    velocity_gradient: wp.array[wp.mat33],
+    particle_flags: wp.array[wp.int32],
     # output
-    strain_rate: wp.array(dtype=wp.mat33),
+    strain_rate: wp.array[wp.mat33],
 ):
     """Compute symmetric strain rate tensor D = 0.5*(L + L^T)."""
     i = wp.tid()
@@ -271,18 +291,18 @@ def compute_strain_rate_kernel(
 @wp.kernel
 def compute_stress_force_kernel(
     grid: wp.uint64,
-    pos: wp.array(dtype=wp.vec3),
-    mass: wp.array(dtype=float),
-    density: wp.array(dtype=float),
-    stress: wp.array(dtype=wp.mat33),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
+    pos: wp.array[wp.vec3],
+    mass: wp.array[float],
+    density: wp.array[float],
+    stress: wp.array[wp.mat33],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
     h: float,
     support_radius: float,
     reference_density: float,
     gravity: wp.vec3,
     # output
-    accel: wp.array(dtype=wp.vec3),
+    accel: wp.array[wp.vec3],
 ):
     """Compute acceleration from stress tensor divergence.
 
@@ -344,13 +364,13 @@ def compute_stress_force_kernel(
 @wp.kernel
 def compute_artificial_viscosity_kernel(
     grid: wp.uint64,
-    pos: wp.array(dtype=wp.vec3),
-    vel: wp.array(dtype=wp.vec3),
-    mass: wp.array(dtype=float),
-    density: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
-    wall_normal: wp.array(dtype=wp.vec3),
+    pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
+    mass: wp.array[float],
+    density: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
+    wall_normal: wp.array[wp.vec3],
     h: float,
     support_radius: float,
     alpha_visc: float,
@@ -358,7 +378,7 @@ def compute_artificial_viscosity_kernel(
     dummy_beta: float,
     reference_density: float,
     # output
-    accel: wp.array(dtype=wp.vec3),
+    accel: wp.array[wp.vec3],
 ):
     """Monaghan-type artificial viscosity.
 
@@ -415,20 +435,20 @@ def compute_artificial_viscosity_kernel(
 @wp.kernel
 def xsph_correction_kernel(
     grid: wp.uint64,
-    pos: wp.array(dtype=wp.vec3),
-    vel: wp.array(dtype=wp.vec3),
-    mass: wp.array(dtype=float),
-    density: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
-    wall_normal: wp.array(dtype=wp.vec3),
+    pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
+    mass: wp.array[float],
+    density: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
+    wall_normal: wp.array[wp.vec3],
     h: float,
     support_radius: float,
     epsilon: float,
     dummy_beta: float,
     reference_density: float,
     # output (in-place)
-    vel_out: wp.array(dtype=wp.vec3),
+    vel_out: wp.array[wp.vec3],
 ):
     """XSPH velocity correction for stability.
 
@@ -478,18 +498,18 @@ def xsph_correction_kernel(
 
 @wp.kernel
 def integrate_symplectic_euler_kernel(
-    pos_in: wp.array(dtype=wp.vec3),
-    vel_in: wp.array(dtype=wp.vec3),
-    accel: wp.array(dtype=wp.vec3),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
-    particle_world: wp.array(dtype=wp.int32),
-    gravity: wp.array(dtype=wp.vec3),
+    pos_in: wp.array[wp.vec3],
+    vel_in: wp.array[wp.vec3],
+    accel: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
+    particle_world: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
     dt: float,
     v_max: float,
     # output
-    pos_out: wp.array(dtype=wp.vec3),
-    vel_out: wp.array(dtype=wp.vec3),
+    pos_out: wp.array[wp.vec3],
+    vel_out: wp.array[wp.vec3],
 ):
     """Symplectic (semi-implicit) Euler time integration.
 
@@ -519,9 +539,7 @@ def integrate_symplectic_euler_kernel(
     # Guard against NaN/Inf from upstream stress or density errors.  A NaN
     # velocity would silently propagate and corrupt the entire simulation;
     # zeroing the affected particle keeps it recoverable.
-    if wp.isnan(v1[0]) or wp.isnan(v1[1]) or wp.isnan(v1[2]) or wp.isinf(v1[0]) or wp.isinf(v1[1]) or wp.isinf(
-        v1[2]
-    ):
+    if wp.isnan(v1[0]) or wp.isnan(v1[1]) or wp.isnan(v1[2]) or wp.isinf(v1[0]) or wp.isinf(v1[1]) or wp.isinf(v1[2]):
         v1 = wp.vec3(0.0)
 
     # enforce velocity limit
@@ -543,13 +561,13 @@ def integrate_symplectic_euler_kernel(
 
 @wp.kernel
 def half_step_position_kernel(
-    pos_in: wp.array(dtype=wp.vec3),
-    vel_in: wp.array(dtype=wp.vec3),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
+    pos_in: wp.array[wp.vec3],
+    vel_in: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
     half_dt: float,
     # output
-    pos_mid: wp.array(dtype=wp.vec3),
+    pos_mid: wp.array[wp.vec3],
 ):
     """Advance position by half time step for Verlet midpoint.
 
@@ -570,18 +588,18 @@ def half_step_position_kernel(
 
 @wp.kernel
 def integrate_verlet_final_kernel(
-    pos_mid: wp.array(dtype=wp.vec3),
-    vel_in: wp.array(dtype=wp.vec3),
-    accel: wp.array(dtype=wp.vec3),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
-    particle_world: wp.array(dtype=wp.int32),
-    gravity: wp.array(dtype=wp.vec3),
+    pos_mid: wp.array[wp.vec3],
+    vel_in: wp.array[wp.vec3],
+    accel: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
+    particle_world: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
     dt: float,
     v_max: float,
     # output
-    pos_out: wp.array(dtype=wp.vec3),
-    vel_out: wp.array(dtype=wp.vec3),
+    pos_out: wp.array[wp.vec3],
+    vel_out: wp.array[wp.vec3],
 ):
     """Verlet final step: full-step velocity and position from midpoint.
 
@@ -611,9 +629,7 @@ def integrate_verlet_final_kernel(
     v1 = v0 + (a + g) * dt
 
     # Guard against NaN/Inf from upstream stress or density errors.
-    if wp.isnan(v1[0]) or wp.isnan(v1[1]) or wp.isnan(v1[2]) or wp.isinf(v1[0]) or wp.isinf(v1[1]) or wp.isinf(
-        v1[2]
-    ):
+    if wp.isnan(v1[0]) or wp.isnan(v1[1]) or wp.isnan(v1[2]) or wp.isinf(v1[0]) or wp.isinf(v1[1]) or wp.isinf(v1[2]):
         v1 = wp.vec3(0.0)
 
     # enforce velocity limit
@@ -632,7 +648,7 @@ def integrate_verlet_final_kernel(
 
 @wp.kernel
 def zero_accel_kernel(
-    accel: wp.array(dtype=wp.vec3),
+    accel: wp.array[wp.vec3],
 ):
     """Zero out the acceleration array."""
     i = wp.tid()

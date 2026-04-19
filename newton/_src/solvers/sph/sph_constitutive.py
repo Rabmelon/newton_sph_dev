@@ -167,6 +167,7 @@ def dp_return_mapping(sigma: wp.mat33, alpha_phi: float, k_c: float) -> wp.mat33
 @wp.kernel
 def update_stress_dp_kernel(
     strain_rate: wp.array(dtype=wp.mat33),
+    velocity_gradient: wp.array(dtype=wp.mat33),
     stress_prev: wp.array(dtype=wp.mat33),
     young_modulus: wp.array(dtype=float),
     poisson_ratio: wp.array(dtype=float),
@@ -183,9 +184,13 @@ def update_stress_dp_kernel(
 ):
     """Update Cauchy stress via Drucker-Prager elastic-plastic model.
 
+    Uses the Jaumann objective stress rate for frame-indifference under
+    rotation: sigma_trial = sigma_prev + Hooke(D)*dt + (W*sigma - sigma*W)*dt
+    where W = 0.5*(L - L^T) is the spin tensor.
+
     Steps:
         1. Compute elastic moduli K and G from E and nu.
-        2. Compute trial stress: sigma_trial = sigma_prev + Hooke(D, K, G, dt).
+        2. Compute trial stress with Jaumann correction.
         3. Apply Drucker-Prager return mapping.
         4. Compute pressure P = -tr(sigma) / 3.
         5. Accumulate equivalent plastic strain.
@@ -207,12 +212,18 @@ def update_stress_dp_kernel(
     K = E / (3.0 * (1.0 - 2.0 * nu))
     G = E / (2.0 * (1.0 + nu))
 
-    # Trial stress increment
+    # Trial stress increment (Hooke's law)
     D = strain_rate[i]
     d_sigma = hooke_stress_increment(D, K, G, dt)
 
-    # Trial stress
-    sigma_trial = stress_prev[i] + d_sigma
+    # Jaumann objective stress rate correction
+    L = velocity_gradient[i]
+    W = 0.5 * (L - wp.transpose(L))  # spin tensor
+    sigma_prev_i = stress_prev[i]
+    jaumann = W * sigma_prev_i - sigma_prev_i * W
+
+    # Trial stress with Jaumann correction
+    sigma_trial = sigma_prev_i + d_sigma + jaumann * dt
 
     # Drucker-Prager parameters
     dp = drucker_prager_params(phi, c)

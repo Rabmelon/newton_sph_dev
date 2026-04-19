@@ -21,3 +21,6 @@ __pycache__/
 # 测试覆盖率
 coverage/
 .cache/
+
+# 朝廷档案
+.court/

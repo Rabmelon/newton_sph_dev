@@ -94,7 +94,7 @@ class SolverSPH(SolverBase):
         """Monaghan artificial viscosity coefficient alpha."""
 
         # --- Time integration ---
-        integration_scheme: str = "symplectic_euler"
+        integration_scheme: str = "position_verlet"
         """Time integration: ``'symplectic_euler'`` or ``'position_verlet'``."""
 
         # --- Neighbor search ---
@@ -108,6 +108,8 @@ class SolverSPH(SolverBase):
         """SDF penalty boundary stiffness [N/m]."""
         penalty_damping: float = 1.0e3
         """SDF penalty boundary damping [N*s/m]."""
+        boundary_friction: float = 0.5
+        """Coulomb friction coefficient mu for penalty boundary surfaces."""
         restitution: float = 0.3
         """Domain boundary inelastic collision restitution coefficient."""
         domain_lo: tuple | None = None
@@ -118,7 +120,7 @@ class SolverSPH(SolverBase):
         """Distance-based dummy boundary extrapolation factor."""
 
         # --- Corrections ---
-        xsph_epsilon: float = 0.5
+        xsph_epsilon: float = 0.0
         """XSPH velocity smoothing factor (0 = off, 1 = full)."""
 
         # --- Granular damping ---
@@ -263,6 +265,7 @@ class SolverSPH(SolverBase):
         # Scratch arrays
         n = model.particle_count
         self._accel = wp.zeros(n, dtype=wp.vec3, device=model.device)
+        self._density_prev = wp.zeros(n, dtype=float, device=model.device)
 
         # Midpoint position buffer for Position-based Verlet integration
         if config.integration_scheme == "position_verlet":
@@ -288,7 +291,7 @@ class SolverSPH(SolverBase):
         pt = self._particle_type.numpy()
         self._fluid_count = int(np.sum(pt == 0))
         if 0 < self._fluid_count < n:
-            if not np.all(pt[:self._fluid_count] == 0):
+            if not np.all(pt[: self._fluid_count] == 0):
                 warnings.warn(
                     "Fluid particles are not contiguous at the front of the particle "
                     "array. Falling back to launching kernels with dim=particle_count.",
@@ -463,7 +466,8 @@ class SolverSPH(SolverBase):
         self._build_neighbor_list(state_in, pos=self._pos_mid)
 
         # 3. Compute density at midpoint -> write to state_out
-        self._compute_density(state_out, pos=self._pos_mid)
+        #    Use state_in density as Shepard correction reference (not stale state_out)
+        self._compute_density(state_out, pos=self._pos_mid, density_prev_source=state_in.sph.density)
 
         # 4. Zero acceleration
         self._accel.zero_()
@@ -472,7 +476,13 @@ class SolverSPH(SolverBase):
         if self._config.simulation_method == "dp":
             self._compute_velocity_gradient(state_out, pos=self._pos_mid, vel=state_in.particle_qd)
             self._compute_strain_rate(state_out)
-            self._compute_stress_dp(state_in, state_out, dt, strain_rate=state_out.sph.strain_rate)
+            self._compute_stress_dp(
+                state_in,
+                state_out,
+                dt,
+                strain_rate=state_out.sph.strain_rate,
+                velocity_gradient=state_out.sph.velocity_gradient,
+            )
             self._compute_stress_forces(state_in, state_out, pos=self._pos_mid, density=state_out.sph.density)
         elif self._config.simulation_method == "mui":
             self._compute_velocity_gradient(state_out, pos=self._pos_mid, vel=state_in.particle_qd)
@@ -535,9 +545,26 @@ class SolverSPH(SolverBase):
         positions = pos if pos is not None else state.particle_q
         self._hash_grid.build(positions, self._support_radius)
 
-    def _compute_density(self, state: newton.State, *, pos: wp.array[wp.vec3] | None = None) -> None:
-        """Compute SPH density via direct summation."""
+    def _compute_density(
+        self,
+        state: newton.State,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+        density_prev_source: wp.array[float] | None = None,
+    ) -> None:
+        """Compute SPH density via Shepard-corrected direct summation.
+
+        Args:
+            state: State whose density array will be written.
+            pos: Override positions (e.g. midpoint for Verlet).
+            density_prev_source: Previous-step density for Shepard correction.
+                Defaults to ``state.sph.density`` (correct for symplectic Euler
+                where state_in has the previous density). For position Verlet,
+                pass ``state_in.sph.density`` explicitly.
+        """
         positions = pos if pos is not None else state.particle_q
+        src = density_prev_source if density_prev_source is not None else state.sph.density
+        wp.copy(self._density_prev, src)
         wp.launch(
             compute_density_kernel,
             dim=self._fluid_count,
@@ -545,10 +572,12 @@ class SolverSPH(SolverBase):
                 self._hash_grid.id,
                 positions,
                 self.model.particle_mass,
+                self._density_prev,
                 self.model.particle_flags,
                 self._particle_type,
                 self._h,
                 self._support_radius,
+                self._config.reference_density,
             ],
             outputs=[state.sph.density],
             device=self.model.device,
@@ -606,12 +635,15 @@ class SolverSPH(SolverBase):
         dt: float,
         *,
         strain_rate: wp.array[wp.mat33] | None = None,
+        velocity_gradient: wp.array[wp.mat33] | None = None,
     ) -> None:
         """Compute stress via Drucker-Prager elastic-plastic model.
 
         Reads previous stress from state_in, writes new stress to state_out.
+        Uses Jaumann objective stress rate for frame-indifference.
         """
         sr = strain_rate if strain_rate is not None else state_in.sph.strain_rate
+        vg = velocity_gradient if velocity_gradient is not None else state_in.sph.velocity_gradient
         # Copy plastic_strain from state_in to state_out for accumulation
         wp.copy(state_out.sph.plastic_strain, state_in.sph.plastic_strain)
         wp.launch(
@@ -619,6 +651,7 @@ class SolverSPH(SolverBase):
             dim=self._fluid_count,
             inputs=[
                 sr,
+                vg,
                 state_in.sph.stress,
                 self.model.sph.young_modulus,
                 self.model.sph.poisson_ratio,
@@ -772,6 +805,7 @@ class SolverSPH(SolverBase):
                     offset,
                     self._config.penalty_stiffness,
                     self._config.penalty_damping,
+                    self._config.boundary_friction,
                 ],
                 outputs=[self._accel],
                 device=self.model.device,
