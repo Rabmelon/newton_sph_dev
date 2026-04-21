@@ -285,6 +285,8 @@ arange = "arange"
 ba = "ba"
 HAA = "HAA"
 lod = "lod"
+# Surname used in "Shepard interpolation" / Shepard-corrected density (SPH solver)
+Shepard = "Shepard"
 # MuJoCo Menagerie brand/product names
 Pincher = "Pincher"
 Robotis = "Robotis"
