@@ -31,6 +31,7 @@ import warp as wp
 
 import newton
 
+from ...geometry import GeoType
 from ..solver import SolverBase
 from .sph_boundary import ground_plane_penalty_kernel
 from .sph_constitutive import (
@@ -112,10 +113,6 @@ class SolverSPH(SolverBase):
         """Coulomb friction coefficient mu for penalty boundary surfaces."""
         restitution: float = 0.3
         """Domain boundary inelastic collision restitution coefficient."""
-        domain_lo: tuple | None = None
-        """Optional domain lower bound for boundary clamping [m]."""
-        domain_hi: tuple | None = None
-        """Optional domain upper bound for boundary clamping [m]."""
         dummy_beta: float = 1.7
         """Distance-based dummy boundary extrapolation factor."""
 
@@ -126,6 +123,25 @@ class SolverSPH(SolverBase):
         # --- Granular damping ---
         viscous_damping: float = 0.0
         """Viscous damping factor: F_d = -eps * sqrt(E / (rho * h^2)) * v."""
+
+        def __post_init__(self) -> None:
+            supported_simulation_methods = {"dp", "mui"}
+            if self.simulation_method not in supported_simulation_methods:
+                raise ValueError(
+                    f"Invalid simulation_method: {self.simulation_method}. "
+                    f"Must be one of {supported_simulation_methods}."
+                )
+            supported_integration_schemes = {"symplectic_euler", "position_verlet"}
+            if self.integration_scheme not in supported_integration_schemes:
+                raise ValueError(
+                    f"Invalid integration_scheme: {self.integration_scheme}. "
+                    f"Must be one of {supported_integration_schemes}."
+                )
+            supported_boundary_types = {"penalty", "dummy"}
+            if self.boundary_type not in supported_boundary_types:
+                raise ValueError(
+                    f"Invalid boundary_type: {self.boundary_type}. Must be one of {supported_boundary_types}."
+                )
 
     @classmethod
     def register_custom_attributes(cls, builder: newton.ModelBuilder) -> None:
@@ -281,7 +297,7 @@ class SolverSPH(SolverBase):
         self._gravity_vec = self._extract_gravity_vec()
 
         # Cache ground plane data for penalty boundary to avoid GPU→CPU sync
-        # in the hot loop (apply_ground_plane_penalty reads shape arrays every call).
+        # in the hot loop.
         if config.boundary_type == "penalty":
             self._ground_planes = self._extract_ground_planes()
 
@@ -311,8 +327,6 @@ class SolverSPH(SolverBase):
         Reads shape geometry arrays once so that the hot loop can launch
         penalty kernels without GPU→CPU synchronization.
         """
-        from ...geometry import GeoType
-
         model = self.model
         if model.shape_count == 0:
             return []
@@ -341,7 +355,8 @@ class SolverSPH(SolverBase):
         return self._h
 
     def notify_model_changed(self, flags: int) -> None:
-        from newton.solvers import SolverNotifyFlags
+        # Deferred import avoids circular `newton.solvers → SolverSPH → newton.solvers`.
+        from newton.solvers import SolverNotifyFlags  # noqa: PLC0415
 
         if flags & SolverNotifyFlags.MODEL_PROPERTIES:
             self._gravity_vec = self._extract_gravity_vec()
@@ -381,7 +396,7 @@ class SolverSPH(SolverBase):
         if not self._cfl_warned and dt > self._dt_cfl_static * 2.0:
             warnings.warn(
                 f"SPH dt={dt:.3e} s exceeds acoustic CFL limit "
-                f"{self._dt_cfl_static:.3e} s (ratio={dt / self._dt_cfl_static:.1f}×). "
+                f"{self._dt_cfl_static:.3e} s (ratio={dt / self._dt_cfl_static:.1f}×). "  # noqa: RUF001
                 "Reduce sim_dt or increase substeps to avoid particle explosion.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -418,6 +433,8 @@ class SolverSPH(SolverBase):
             self._compute_strain_rate(state_in)
             self._compute_stress_mui(state_in, state_out, dt)
             self._compute_stress_forces(state_in, state_out)
+        else:
+            raise ValueError(f"Unknown simulation_method={self._config.simulation_method!r}")
 
         # 7. Artificial viscosity
         if self._config.artificial_viscosity_alpha > 0.0:
@@ -495,6 +512,8 @@ class SolverSPH(SolverBase):
                 density=state_out.sph.density,
             )
             self._compute_stress_forces(state_in, state_out, pos=self._pos_mid, density=state_out.sph.density)
+        else:
+            raise ValueError(f"Unknown simulation_method={self._config.simulation_method!r}")
 
         # 7. Artificial viscosity at midpoint
         if self._config.artificial_viscosity_alpha > 0.0:
@@ -616,7 +635,6 @@ class SolverSPH(SolverBase):
 
     def _compute_strain_rate(self, state: newton.State) -> None:
         """Compute strain rate D = 0.5 * (L + L^T)."""
-        n = self.model.particle_count
         wp.launch(
             compute_strain_rate_kernel,
             dim=self._fluid_count,
@@ -835,7 +853,6 @@ class SolverSPH(SolverBase):
 
     def _xsph_correction(self, state: newton.State) -> None:
         """Apply XSPH velocity smoothing correction in-place."""
-        n = self.model.particle_count
         wp.launch(
             xsph_correction_kernel,
             dim=self._fluid_count,

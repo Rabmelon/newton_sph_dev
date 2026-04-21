@@ -151,10 +151,10 @@ class Example:
 
 @wp.kernel
 def _update_grains_kernel(
-    particle_pos: wp.array(dtype=wp.vec3),
-    offsets: wp.array2d(dtype=wp.vec3),
+    particle_pos: wp.array[wp.vec3],
+    offsets: wp.array2d[wp.vec3],
     # output
-    grain_pos: wp.array2d(dtype=wp.vec3),
+    grain_pos: wp.array2d[wp.vec3],
 ):
     """Update grain positions: grain_pos[i,j] = particle_pos[i] + offsets[i,j]."""
     i, j = wp.tid()

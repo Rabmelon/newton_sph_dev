@@ -174,7 +174,6 @@ def generate_dummy_particles(
     # Interior ranges (domain faces only)
     xs = np.arange(lo[0], hi[0] + 0.5 * dx, dx, dtype=np.float32)
     ys = np.arange(lo[1], hi[1] + 0.5 * dx, dx, dtype=np.float32)
-    zs = np.arange(lo[2], hi[2] + 0.5 * dx, dx, dtype=np.float32)
 
     # Extended ranges that include the dummy layer region, covering edges
     # and corners.  Priority: ±X covers all edges/corners it touches,

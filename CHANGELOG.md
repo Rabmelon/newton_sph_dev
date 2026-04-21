@@ -79,6 +79,7 @@
 
 - Remove `Heightfield.finalize()` and stop storing raw pointers for heightfields in `Model.shape_source_ptr`; heightfield collision data is accessed via `Model.shape_heightfield_index` / `Model.heightfield_data` / `Model.heightfield_elevations`
 - Remove `robot_humanoid` example in favor of `basic_plotting` which uses the same humanoid model with diagnostics visualization
+- Remove unused `SolverSPH.Config.domain_lo` and `SolverSPH.Config.domain_hi` fields; they were declared but never read. Use `SolverSPH.add_dummy_particles(bounds_lo=..., bounds_hi=...)` for domain bounds instead.
 
 ### Fixed
 
@@ -118,6 +119,7 @@
 - Fix heightfield bounding-sphere radius underestimating Z extent for asymmetric height ranges (e.g. `min_z=0, max_z=10`)
 - Fix VBD self-contact barrier C2 discontinuity at `d = tau` caused by a factor-of-two error in the log-barrier coefficient
 - Fix fast inertia validation treating near-symmetric tensors within `np.allclose()` default tolerances as corrections, aligning CPU and GPU validation warnings
+- Raise `ValueError` for invalid `SolverSPH.Config.simulation_method`, `integration_scheme`, and `boundary_type` strings instead of silently falling through (previously, an unrecognized `simulation_method` skipped stress updates entirely; `integration_scheme` fell back to symplectic Euler; `boundary_type` silently disabled the penalty branch)
 
 ## [1.0.0] - 2026-03-10
 

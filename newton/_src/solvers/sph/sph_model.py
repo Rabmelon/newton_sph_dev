@@ -21,11 +21,11 @@ wp.set_module_options({"enable_backward": False})
 
 @wp.kernel
 def _compute_volumes_kernel(
-    mass: wp.array(dtype=float),
-    inv_mass: wp.array(dtype=float),
+    mass: wp.array[float],
+    inv_mass: wp.array[float],
     reference_density: float,
     # output
-    volume: wp.array(dtype=float),
+    volume: wp.array[float],
 ):
     """Compute particle volume from mass and reference density: V_i = m_i / rho_0."""
     i = wp.tid()

@@ -3,9 +3,9 @@
 
 """SPH boundary handling.
 
-Provides penalty-based boundary forces for ground planes and other collider
-shapes. The ground plane is detected from the model's shape list (shapes
-with ``GEO_PLANE`` type).
+Provides the penalty-based boundary force kernel for ground planes. The
+per-plane launch loop lives in :class:`SolverSPH` (using cached plane
+data); this module exposes only the device-side kernel.
 
 References:
     - tiSPHi ``enforce_boundary()``
@@ -14,14 +14,9 @@ References:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import warp as wp
 
-from ...geometry import GeoType, ParticleFlags
-
-if TYPE_CHECKING:
-    import newton
+from ...geometry import ParticleFlags
 
 wp.set_module_options({"enable_backward": False})
 
@@ -30,16 +25,16 @@ _EPSILON = wp.constant(1.0e-8)
 
 @wp.kernel
 def ground_plane_penalty_kernel(
-    pos: wp.array(dtype=wp.vec3),
-    vel: wp.array(dtype=wp.vec3),
-    particle_flags: wp.array(dtype=wp.int32),
+    pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
     plane_normal: wp.vec3,
     plane_offset: float,
     ke: float,
     kd: float,
     mu_f: float,
     # output (accumulated)
-    accel: wp.array(dtype=wp.vec3),
+    accel: wp.array[wp.vec3],
 ):
     """Apply penalty force for a ground plane boundary.
 
@@ -93,72 +88,3 @@ def ground_plane_penalty_kernel(
                 # Regularization: cap by damping-like term to avoid chatter
                 f_t_mag = wp.min(f_t_mag, kd * v_t_norm)
                 accel[i] = accel[i] - (f_t_mag / wp.max(v_t_norm, _EPSILON)) * v_t
-
-
-def apply_ground_plane_penalty(
-    model: newton.Model,
-    state: newton.State,
-    accel: wp.array,
-    ke: float,
-    kd: float,
-    mu_f: float = 0.0,
-) -> None:
-    """Apply ground-plane penalty forces for all plane shapes in the model.
-
-    Iterates over model shapes and applies a penalty force for each shape
-    whose geometry type is ``GEO_PLANE``.
-
-    Args:
-        model: Newton model with shapes.
-        state: Current simulation state.
-        accel: Acceleration array to accumulate into.
-        ke: Penalty stiffness [m/s^2 per m penetration].
-        kd: Penalty damping coefficient.
-        mu_f: Coulomb friction coefficient for tangential friction.
-    """
-    n = model.particle_count
-    if n == 0:
-        return
-
-    # Read shape data on CPU to iterate over planes
-    shape_count = model.shape_count
-    if shape_count == 0:
-        return
-
-    geo_types = model.shape_type.numpy()
-    shape_transforms = model.shape_transform.numpy() if model.shape_count > 0 else None
-
-    for s in range(shape_count):
-        if geo_types[s] == int(GeoType.PLANE):
-            # Ground plane: normal is the z-axis of the shape transform
-            # For a default ground plane, the transform rotation encodes
-            # the plane orientation. We extract the "up" vector.
-            tf = shape_transforms[s]
-            # Transform is stored as [tx, ty, tz, qx, qy, qz, qw]
-            px, py, pz = float(tf[0]), float(tf[1]), float(tf[2])
-            qx, qy, qz, qw = float(tf[3]), float(tf[4]), float(tf[5]), float(tf[6])
-
-            # Compute the plane normal (rotate [0,0,1] by the quaternion)
-            # Using quaternion rotation formula
-            q = wp.quat(qx, qy, qz, qw)
-            up = wp.vec3(0.0, 0.0, 1.0)
-            normal = wp.quat_rotate(q, up)
-            # Plane offset: d = -dot(n, p) where p is a point on the plane
-            plane_offset = -(normal[0] * px + normal[1] * py + normal[2] * pz)
-
-            wp.launch(
-                ground_plane_penalty_kernel,
-                dim=n,
-                inputs=[
-                    state.particle_q,
-                    state.particle_qd,
-                    model.particle_flags,
-                    normal,
-                    plane_offset,
-                    ke,
-                    kd,
-                    mu_f,
-                ],
-                outputs=[accel],
-                device=model.device,
-            )

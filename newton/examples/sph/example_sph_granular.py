@@ -199,9 +199,15 @@ class Example:
         parser.add_argument("--substeps", type=int, default=None)
         # Simulation duration and end-of-run behavior
         parser.add_argument("--duration", type=float, default=0.1, help="Simulation duration in seconds")
-        parser.add_argument("--end-behavior", type=str, default="exit", choices=["pause", "exit"],
-            help=("What to do when the simulation reaches the specified duration: "
-                    "'pause' keeps the GUI open, 'exit' closes the simulation window."),
+        parser.add_argument(
+            "--end-behavior",
+            type=str,
+            default="exit",
+            choices=["pause", "exit"],
+            help=(
+                "What to do when the simulation reaches the specified duration: "
+                "'pause' keeps the GUI open, 'exit' closes the simulation window."
+            ),
         )
 
         # SPH

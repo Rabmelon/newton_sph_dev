@@ -166,21 +166,21 @@ def dp_return_mapping(sigma: wp.mat33, alpha_phi: float, k_c: float) -> wp.mat33
 
 @wp.kernel
 def update_stress_dp_kernel(
-    strain_rate: wp.array(dtype=wp.mat33),
-    velocity_gradient: wp.array(dtype=wp.mat33),
-    stress_prev: wp.array(dtype=wp.mat33),
-    young_modulus: wp.array(dtype=float),
-    poisson_ratio: wp.array(dtype=float),
-    friction: wp.array(dtype=float),
-    cohesion: wp.array(dtype=float),
-    dilatancy: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
+    strain_rate: wp.array[wp.mat33],
+    velocity_gradient: wp.array[wp.mat33],
+    stress_prev: wp.array[wp.mat33],
+    young_modulus: wp.array[float],
+    poisson_ratio: wp.array[float],
+    friction: wp.array[float],
+    cohesion: wp.array[float],
+    dilatancy: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
     dt: float,
     # output (in-place for stress)
-    stress_out: wp.array(dtype=wp.mat33),
-    pressure_out: wp.array(dtype=float),
-    plastic_strain_out: wp.array(dtype=float),
+    stress_out: wp.array[wp.mat33],
+    pressure_out: wp.array[float],
+    plastic_strain_out: wp.array[float],
 ):
     """Update Cauchy stress via Drucker-Prager elastic-plastic model.
 
@@ -257,20 +257,20 @@ def update_stress_dp_kernel(
 
 @wp.kernel
 def update_stress_mui_kernel(
-    strain_rate: wp.array(dtype=wp.mat33),
-    density: wp.array(dtype=float),
-    friction: wp.array(dtype=float),
-    cohesion: wp.array(dtype=float),
-    viscosity: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
+    strain_rate: wp.array[wp.mat33],
+    density: wp.array[float],
+    friction: wp.array[float],
+    cohesion: wp.array[float],
+    viscosity: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
     reference_density: float,
     sound_speed: float,
     eos_gamma: float,
     smoothing_length: float,
     # output
-    stress_out: wp.array(dtype=wp.mat33),
-    pressure_out: wp.array(dtype=float),
+    stress_out: wp.array[wp.mat33],
+    pressure_out: wp.array[float],
 ):
     """Update stress via mu(I) rheology.
 
@@ -348,15 +348,15 @@ def update_stress_mui_kernel(
 
 @wp.kernel
 def initialize_geostatic_stress_kernel(
-    pos: wp.array(dtype=wp.vec3),
-    friction: wp.array(dtype=float),
-    particle_flags: wp.array(dtype=wp.int32),
-    particle_type: wp.array(dtype=wp.int32),
+    pos: wp.array[wp.vec3],
+    friction: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
     reference_density: float,
     g_mag: float,
     z_max: float,
     # output
-    stress: wp.array(dtype=wp.mat33),
+    stress: wp.array[wp.mat33],
 ):
     """Initialize stress using K0 earth pressure condition.
 

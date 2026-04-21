@@ -639,17 +639,3 @@ def integrate_verlet_final_kernel(
 
     pos_out[i] = x_mid + v1 * (dt * 0.5)
     vel_out[i] = v1
-
-
-# ---------------------------------------------------------------------------
-# Zero acceleration kernel
-# ---------------------------------------------------------------------------
-
-
-@wp.kernel
-def zero_accel_kernel(
-    accel: wp.array[wp.vec3],
-):
-    """Zero out the acceleration array."""
-    i = wp.tid()
-    accel[i] = wp.vec3(0.0)
