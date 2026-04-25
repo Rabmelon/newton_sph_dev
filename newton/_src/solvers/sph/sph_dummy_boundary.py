@@ -148,10 +148,9 @@ def generate_dummy_particles(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Generate layered dummy particle positions, normals, and types.
 
-    Creates multiple layers of particles outside each face of an AABB domain
-    box. The layer thickness is ``2 * h``, with ``ceil(2h / dx)`` layers
-    spaced by ``dx``.  Edges and corners of the AABB are also covered by
-    extending the in-plane ranges of higher-priority faces.
+    Creates ``ceil(2h / dx)`` layers of particles below the -Z face of the
+    AABB domain box, spaced by ``dx``. Lateral (±X, ±Y) and +Z faces are not
+    populated — column-collapse setups have no constraining walls.
 
     Args:
         bounds_lo: Domain AABB lower corner [m].
@@ -161,8 +160,8 @@ def generate_dummy_particles(
         slip_type: ``'noslip'`` or ``'freeslip'``.
 
     Returns:
-        Tuple of (positions, normals, particle_types), each shape ``[M, 3]``
-        or ``[M]`` for types.
+        Tuple of (positions, normals, particle_types), shapes ``[M, 3]``,
+        ``[M, 3]``, ``[M]``.
     """
     lo = np.asarray(bounds_lo, dtype=np.float32)
     hi = np.asarray(bounds_hi, dtype=np.float32)
@@ -171,15 +170,9 @@ def generate_dummy_particles(
 
     ptype = _SPH_DUMMY_NOSLIP_VAL if slip_type == "noslip" else _SPH_DUMMY_FREESLIP_VAL
 
-    # Interior ranges (domain faces only)
+    # Interior ranges along the -Z floor only.
     xs = np.arange(lo[0], hi[0] + 0.5 * dx, dx, dtype=np.float32)
     ys = np.arange(lo[1], hi[1] + 0.5 * dx, dx, dtype=np.float32)
-
-    # Extended ranges that include the dummy layer region, covering edges
-    # and corners.  Priority: ±X covers all edges/corners it touches,
-    # ±Y covers remaining Z-edges, ±Z uses interior ranges only.
-    # ys_ext = np.arange(lo[1] - thickness, hi[1] + thickness + 0.5 * dx, dx, dtype=np.float32)
-    # zs_ext = np.arange(lo[2] - thickness, hi[2] + thickness + 0.5 * dx, dx, dtype=np.float32)
 
     positions: list[np.ndarray] = []
     normals: list[np.ndarray] = []
@@ -198,15 +191,7 @@ def generate_dummy_particles(
 
     for layer in range(1, layer_count + 1):
         off = float(layer) * dx
-        # ±X faces use extended y and z (covers X-edges and all 8 corners)
-        # _add_plane(0, 1.0, float(lo[0] - off), ys_ext, zs_ext)
-        # _add_plane(0, -1.0, float(hi[0] + off), ys_ext, zs_ext)
-        # ±Y faces use interior x, extended z (covers Y-Z edges)
-        # _add_plane(1, 1.0, float(lo[1] - off), xs, zs_ext)
-        # _add_plane(1, -1.0, float(hi[1] + off), xs, zs_ext)
-        # ±Z faces use interior x and y (edges/corners already covered)
         _add_plane(2, 1.0, float(lo[2] - off), xs, ys)
-        # _add_plane(2, -1.0, float(hi[2] + off), xs, ys)
 
     if not positions:
         return (
