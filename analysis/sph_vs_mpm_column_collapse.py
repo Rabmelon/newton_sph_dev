@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import itertools
+import math
 import re
 import subprocess
 import sys
@@ -46,16 +47,24 @@ RESULTS_DIR = Path(__file__).resolve().parent / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Harmonized scenario parameters (passed as CLI args to both examples).
+#
+# Friction-unit caveat resolved here:
+#   - SPH ``--friction`` is interpreted by ``sph_constitutive.py`` as
+#     phi in radians (yield surface uses tan(phi) internally).
+#   - MPM ``--friction`` is interpreted by ``implicit_mpm_solver_kernels.py``
+#     as the coefficient mu = tan(phi).
+# The harness stores a single canonical ``phi_deg`` and converts per solver in
+# ``_friction_args(solver)``.
 SCENARIO = {
     "cylinder_radius": 0.1,  # [m] L_0
     "cylinder_height": 0.2,  # [m] H
-    "particle_spacing": 0.005,  # [m] dx; gives ~50k particles
+    "particle_spacing": 0.005,  # [m] dx; cylinder ~ pi R^2 H / dx^3 particles
     "duration": 0.5,  # [s]
     "fps": 60.0,
     "density": 2500.0,  # [kg/m^3]
     "young_modulus": 1.0e6,  # [Pa]
     "poisson_ratio": 0.3,
-    "friction": 0.5,  # [-] tan(phi); phi ≈ 26.6 deg
+    "phi_deg": 30.0,  # canonical internal-friction angle [deg]
     "viscosity": 0.0,
     "gravity": (0.0, 0.0, -9.81),
 }
@@ -116,8 +125,8 @@ class RunResult:
         return self.frames[-1]["ke"] if self.frames else float("nan")
 
 
-def _scenario_args() -> list[str]:
-    """Build CLI args common to both examples from SCENARIO."""
+def _common_args() -> list[str]:
+    """Build solver-agnostic CLI args from SCENARIO. Excludes friction."""
     g = SCENARIO["gravity"]
     return [
         "--cylinder-radius",
@@ -136,8 +145,6 @@ def _scenario_args() -> list[str]:
         str(SCENARIO["young_modulus"]),
         "--poisson-ratio",
         str(SCENARIO["poisson_ratio"]),
-        "--friction",
-        str(SCENARIO["friction"]),
         "--viscosity",
         str(SCENARIO["viscosity"]),
         "--gravity",
@@ -147,7 +154,29 @@ def _scenario_args() -> list[str]:
     ]
 
 
-def run_subprocess(label: str, example: str, extra_args: list[str], device: str, timeout_s: float) -> RunResult:
+def _friction_args(solver: str) -> list[str]:
+    """Return solver-specific ``--friction`` CLI argument.
+
+    SPH treats ``--friction`` as phi in radians; MPM treats it as
+    mu = tan(phi). Both are derived from the canonical ``phi_deg``.
+    """
+    phi_rad = math.radians(SCENARIO["phi_deg"])
+    if solver == "sph":
+        return ["--friction", f"{phi_rad:.10f}"]
+    return ["--friction", f"{math.tan(phi_rad):.10f}"]
+
+
+def estimate_particle_count() -> int:
+    """Estimate cylinder particle count from geometry: pi R^2 H / dx^3."""
+    r = SCENARIO["cylinder_radius"]
+    h = SCENARIO["cylinder_height"]
+    dx = SCENARIO["particle_spacing"]
+    return int(math.pi * r * r * h / (dx**3))
+
+
+def run_subprocess(
+    label: str, example: str, solver: str, extra_args: list[str], device: str, timeout_s: float
+) -> RunResult:
     """Run a single Newton example as a subprocess and parse diagnostics.
 
     Args:
@@ -177,11 +206,12 @@ def run_subprocess(label: str, example: str, extra_args: list[str], device: str,
         "--num-frames",
         str(int(SCENARIO["duration"] * SCENARIO["fps"]) + 10),
     ]
-    cmd.extend(_scenario_args())
+    cmd.extend(_common_args())
+    cmd.extend(_friction_args(solver))
     cmd.extend(extra_args)
 
-    solver = "sph" if example.startswith("sph") else "mpm"
     result = RunResult(solver=solver, config=label, cmd=cmd)
+    result.particle_count = estimate_particle_count()
 
     print(f"[{label}] launching: {' '.join(cmd)}", flush=True)
     t0 = time.perf_counter()
@@ -223,8 +253,7 @@ def run_subprocess(label: str, example: str, extra_args: list[str], device: str,
     wm = WALL_RE.search(stdout) or WALL_RE.search(stderr)
     result.wall_time_s = float(wm.group("sec")) if wm else elapsed
 
-    # Crude particle count: count "add_particles" / log lines if present;
-    # otherwise leave at -1 and infer separately.
+    # Override geometry estimate if the example printed an authoritative count.
     pc_match = re.search(r"particle[_ ]?count[:\s]+(\d+)", stdout, flags=re.IGNORECASE)
     if pc_match:
         result.particle_count = int(pc_match.group(1))
@@ -489,6 +518,7 @@ def main() -> int:
     sph_run = run_subprocess(
         label="sph",
         example="sph_granular",
+        solver="sph",
         extra_args=[],  # uses example defaults (penalty boundary, kh=1.3, c_s=50)
         device=device,
         timeout_s=timeout_s,
@@ -513,6 +543,36 @@ def main() -> int:
             run_subprocess(
                 label=label,
                 example="mpm_granular2",
+                solver="mpm",
+                extra_args=extra,
+                device=device,
+                timeout_s=timeout_s,
+            )
+        )
+
+    # ---- B2 voxel-size sweep -------------------------------------------
+    # Diagnose pathological lockup observed at default voxel_size=0.02 by
+    # holding the basis (B2 + gimp + apic) and varying voxel_size relative to
+    # particle_spacing dx=0.005.
+    for vs in (0.01, 0.02, 0.04):
+        ratio = vs / SCENARIO["particle_spacing"]
+        label = f"mpm-B2-gimp-apic-vs{vs:.3f}"
+        extra = [
+            "--velocity-basis",
+            "B2",
+            "--integration-scheme",
+            "gimp",
+            "--transfer-scheme",
+            "apic",
+            "--voxel-size",
+            str(vs),
+        ]
+        print(f"[{label}] voxel/dx ratio = {ratio:.1f}", flush=True)
+        results.append(
+            run_subprocess(
+                label=label,
+                example="mpm_granular2",
+                solver="mpm",
                 extra_args=extra,
                 device=device,
                 timeout_s=timeout_s,
@@ -532,15 +592,23 @@ def main() -> int:
     plot_kinetic_energy(results)
 
     # ---- Console summary ------------------------------------------------
-    print("\n=== Final L_f / L_0 ===")
+    print("\n=== Final L_f / L_0 (matched-resolution comparison) ===")
+    print(
+        "  Note: SPH and MPM run at identical particle_spacing dx and identical "
+        "physical params.\n  SPH uses acoustic-CFL substeps (~hundreds per frame); MPM "
+        "uses 1 implicit substep per\n  frame. Wall-time differences therefore reflect "
+        "design intent, NOT an unfair compute\n  budget. Accuracy comparison is "
+        "matched-resolution, not matched-wall-time.\n"
+    )
     short_r, tall_r = lube_runout(aspect)
     for r in results:
         if r.frames:
-            print(f"  {r.config:<24s} {r.final_runout / l0:8.3f}  (wall={r.wall_time_s:6.1f}s)")
+            print(f"  {r.config:<32s} {r.final_runout / l0:8.3f}  (wall={r.wall_time_s:6.1f}s, N={r.particle_count})")
         else:
-            print(f"  {r.config:<24s} CRASHED ({r.error_tail.splitlines()[-1] if r.error_tail else 'no output'})")
-    print(f"  {'Lube short ref':<24s} {short_r:8.3f}")
-    print(f"  {'Lube tall ref':<24s} {tall_r:8.3f}")
+            print(f"  {r.config:<32s} CRASHED ({r.error_tail.splitlines()[-1] if r.error_tail else 'no output'})")
+    print(f"  {'Lube short ref':<32s} {short_r:8.3f}")
+    print(f"  {'Lube tall ref':<32s} {tall_r:8.3f}")
+    print(f"\n  phi_deg = {SCENARIO['phi_deg']:.2f}° (SPH gets rad; MPM gets tan(rad))")
 
     print(f"\nWrote {RESULTS_DIR}/runs.csv, summary.csv, *.png", flush=True)
     return 0

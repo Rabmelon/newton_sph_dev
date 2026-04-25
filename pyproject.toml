@@ -287,6 +287,8 @@ HAA = "HAA"
 lod = "lod"
 # Surname used in "Shepard interpolation" / Shepard-corrected density (SPH solver)
 Shepard = "Shepard"
+# Surname H. H. Bui — prolific SPH-in-geomechanics author (Bui et al. 2008, etc.)
+Bui = "Bui"
 # MuJoCo Menagerie brand/product names
 Pincher = "Pincher"
 Robotis = "Robotis"
