@@ -16,6 +16,7 @@ References:
 """
 
 import warp as wp
+import warp.fem as fem
 
 from ...geometry import ParticleFlags
 from .sph_dummy_boundary import (
@@ -639,3 +640,325 @@ def integrate_verlet_final_kernel(
 
     pos_out[i] = x_mid + v1 * (dt * 0.5)
     vel_out[i] = v1
+
+
+# ---------------------------------------------------------------------------
+# Specialized kernel factories
+#
+# Each factory returns a Warp kernel specialized on ``has_dummies``. When the
+# model contains only fluid particles, the neighbor-side dummy-substitution
+# branch is eliminated at compile time via ``wp.static``. The integration-
+# center ``particle_type[i]`` guard is kept unconditional per invariant 2 in
+# sph/CLAUDE.md.
+#
+# Factories are cached by ``fem.cache.dynamic_kernel`` keyed on the boolean
+# ``has_dummies`` — two solver instances with the same flag share the same
+# compiled kernel object.
+#
+# ``kernel_options["fast_math"]`` is currently False (Phase A). Phase B will
+# flip it to True after Phase A validation.
+# ---------------------------------------------------------------------------
+
+
+_SPECIALIZED_KERNEL_OPTIONS_PHASE_A = {"fast_math": True, "enable_backward": False}
+
+
+def make_compute_density_kernel(has_dummies: bool):
+    """Factory for a Shepard-corrected density kernel specialized on ``has_dummies``."""
+
+    @fem.cache.dynamic_kernel(
+        suffix=has_dummies,
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
+    )
+    def compute_density_kernel_impl(
+        grid: wp.uint64,
+        pos: wp.array[wp.vec3],
+        mass: wp.array[float],
+        density_prev: wp.array[float],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        h: float,
+        support_radius: float,
+        reference_density: float,
+        density: wp.array[float],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            return
+        if particle_type[i] != SPH_FLUID:
+            return
+
+        xi = pos[i]
+        rho = float(0.0)
+        shepard_sum = float(0.0)
+
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        j = int(0)
+        while wp.hash_grid_query_next(query, j):
+            if (particle_flags[j] & ParticleFlags.ACTIVE) != 0:
+                xj = pos[j]
+                r_vec = xi - xj
+                r = wp.length(r_vec)
+                if r < support_radius:
+                    W = wendland_c2_3d(r, h)
+                    rho += mass[j] * W
+                    rho_j_prev = density_prev[j]
+                    if rho_j_prev > _EPSILON:
+                        shepard_sum += (mass[j] / rho_j_prev) * W
+                    elif wp.static(has_dummies):
+                        if particle_type[j] != SPH_FLUID and reference_density > _EPSILON:
+                            shepard_sum += (mass[j] / reference_density) * W
+
+        if shepard_sum > _EPSILON:
+            density[i] = rho / shepard_sum
+        else:
+            density[i] = rho
+
+    return compute_density_kernel_impl
+
+
+def make_compute_velocity_gradient_kernel(has_dummies: bool):
+    """Factory for a velocity-gradient kernel specialized on ``has_dummies``."""
+
+    @fem.cache.dynamic_kernel(
+        suffix=has_dummies,
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
+    )
+    def compute_velocity_gradient_kernel_impl(
+        grid: wp.uint64,
+        pos: wp.array[wp.vec3],
+        vel: wp.array[wp.vec3],
+        mass: wp.array[float],
+        density: wp.array[float],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        wall_normal: wp.array[wp.vec3],
+        h: float,
+        support_radius: float,
+        dummy_beta: float,
+        reference_density: float,
+        velocity_gradient: wp.array[wp.mat33],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            velocity_gradient[i] = wp.mat33(0.0)
+            return
+        if particle_type[i] != SPH_FLUID:
+            velocity_gradient[i] = wp.mat33(0.0)
+            return
+
+        xi = pos[i]
+        vi = vel[i]
+        L = wp.mat33(0.0)
+
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        j = int(0)
+        while wp.hash_grid_query_next(query, j):
+            if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and j != i:
+                xj = pos[j]
+                r_vec = xi - xj
+                r = wp.length(r_vec)
+                if r < support_radius and r > _EPSILON:
+                    vj = vel[j]
+                    rho_j = density[j]
+                    if wp.static(has_dummies):
+                        if particle_type[j] != SPH_FLUID:
+                            vj = compute_virtual_velocity(vi, vel[j], dummy_beta, wall_normal[j], particle_type[j])
+                            rho_j = reference_density
+                    if rho_j > _EPSILON:
+                        grad_w = wendland_c2_grad_3d(r_vec, r, h)
+                        v_diff = vj - vi
+                        L += (mass[j] / rho_j) * wp.outer(v_diff, grad_w)
+
+        velocity_gradient[i] = L
+
+    return compute_velocity_gradient_kernel_impl
+
+
+def make_compute_stress_force_kernel(has_dummies: bool):
+    """Factory for a stress-divergence force kernel specialized on ``has_dummies``."""
+
+    @fem.cache.dynamic_kernel(
+        suffix=has_dummies,
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
+    )
+    def compute_stress_force_kernel_impl(
+        grid: wp.uint64,
+        pos: wp.array[wp.vec3],
+        mass: wp.array[float],
+        density: wp.array[float],
+        stress: wp.array[wp.mat33],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        h: float,
+        support_radius: float,
+        reference_density: float,
+        gravity: wp.vec3,
+        accel: wp.array[wp.vec3],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            return
+        if particle_type[i] != SPH_FLUID:
+            return
+
+        xi = pos[i]
+        rho_i = density[i]
+        if rho_i < _EPSILON:
+            return
+
+        sigma_i = stress[i]
+        a = wp.vec3(0.0)
+
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        j = int(0)
+        while wp.hash_grid_query_next(query, j):
+            if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and j != i:
+                xj = pos[j]
+                r_vec = xi - xj
+                r = wp.length(r_vec)
+                if r < support_radius and r > _EPSILON:
+                    sigma_j = stress[j]
+                    rho_j = density[j]
+                    if wp.static(has_dummies):
+                        if particle_type[j] != SPH_FLUID:
+                            sigma_j = compute_virtual_stress(
+                                reference_density,
+                                gravity,
+                                xi,
+                                xj,
+                                sigma_i,
+                                particle_type[j],
+                            )
+                            rho_j = reference_density
+                    if rho_j > _EPSILON:
+                        grad_w = wendland_c2_grad_3d(r_vec, r, h)
+                        combined = sigma_i / (rho_i * rho_i) + sigma_j / (rho_j * rho_j)
+                        a += mass[j] * (combined @ grad_w)
+
+        accel[i] = accel[i] + a
+
+    return compute_stress_force_kernel_impl
+
+
+def make_compute_artificial_viscosity_kernel(has_dummies: bool):
+    """Factory for a Monaghan artificial-viscosity kernel specialized on ``has_dummies``."""
+
+    @fem.cache.dynamic_kernel(
+        suffix=has_dummies,
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
+    )
+    def compute_artificial_viscosity_kernel_impl(
+        grid: wp.uint64,
+        pos: wp.array[wp.vec3],
+        vel: wp.array[wp.vec3],
+        mass: wp.array[float],
+        density: wp.array[float],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        wall_normal: wp.array[wp.vec3],
+        h: float,
+        support_radius: float,
+        alpha_visc: float,
+        sound_speed: float,
+        dummy_beta: float,
+        reference_density: float,
+        accel: wp.array[wp.vec3],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            return
+        if particle_type[i] != SPH_FLUID:
+            return
+
+        xi = pos[i]
+        vi = vel[i]
+        rho_i = density[i]
+        a = wp.vec3(0.0)
+        eta_sq = 0.01 * h * h
+
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        j = int(0)
+        while wp.hash_grid_query_next(query, j):
+            if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and j != i:
+                xj = pos[j]
+                r_vec = xi - xj
+                r = wp.length(r_vec)
+                if r < support_radius and r > _EPSILON:
+                    vj = vel[j]
+                    rho_j = density[j]
+                    if wp.static(has_dummies):
+                        if particle_type[j] != SPH_FLUID:
+                            vj = compute_virtual_velocity(vi, vel[j], dummy_beta, wall_normal[j], particle_type[j])
+                            rho_j = reference_density
+                    v_ij = vi - vj
+                    vx = wp.dot(v_ij, r_vec)
+                    if vx < 0.0:
+                        rho_avg = 0.5 * (rho_i + rho_j)
+                        if rho_avg > _EPSILON:
+                            mu_ij = h * vx / (r * r + eta_sq)
+                            Pi_ij = -alpha_visc * sound_speed * mu_ij / rho_avg
+                            grad_w = wendland_c2_grad_3d(r_vec, r, h)
+                            a -= mass[j] * Pi_ij * grad_w
+
+        accel[i] = accel[i] + a
+
+    return compute_artificial_viscosity_kernel_impl
+
+
+def make_xsph_correction_kernel(has_dummies: bool):
+    """Factory for an XSPH velocity-correction kernel specialized on ``has_dummies``."""
+
+    @fem.cache.dynamic_kernel(
+        suffix=has_dummies,
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
+    )
+    def xsph_correction_kernel_impl(
+        grid: wp.uint64,
+        pos: wp.array[wp.vec3],
+        vel: wp.array[wp.vec3],
+        mass: wp.array[float],
+        density: wp.array[float],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        wall_normal: wp.array[wp.vec3],
+        h: float,
+        support_radius: float,
+        epsilon: float,
+        dummy_beta: float,
+        reference_density: float,
+        vel_out: wp.array[wp.vec3],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            return
+        if particle_type[i] != SPH_FLUID:
+            return
+
+        xi = pos[i]
+        vi = vel[i]
+        rho_i = density[i]
+        correction = wp.vec3(0.0)
+
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        j = int(0)
+        while wp.hash_grid_query_next(query, j):
+            if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and j != i:
+                xj = pos[j]
+                r_vec = xi - xj
+                r = wp.length(r_vec)
+                if r < support_radius:
+                    vj = vel[j]
+                    rho_j = density[j]
+                    if wp.static(has_dummies):
+                        if particle_type[j] != SPH_FLUID:
+                            vj = compute_virtual_velocity(vi, vel[j], dummy_beta, wall_normal[j], particle_type[j])
+                            rho_j = reference_density
+                    rho_avg = 0.5 * (rho_i + rho_j)
+                    if rho_avg > _EPSILON:
+                        w = wendland_c2_3d(r, h)
+                        correction += (mass[j] / rho_avg) * (vj - vi) * w
+
+        vel_out[i] = vi + epsilon * correction
+
+    return xsph_correction_kernel_impl

@@ -12,6 +12,11 @@ from newton._src.solvers.sph.sph_constitutive import (
     drucker_prager_params,
     mat33_double_contraction,
 )
+from newton._src.solvers.sph.sph_kernels import (
+    make_compute_density_kernel,
+    make_compute_stress_force_kernel,
+    make_compute_velocity_gradient_kernel,
+)
 from newton.solvers import SolverSPH
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -402,6 +407,56 @@ def test_sand_cube_position_verlet(test, device):
     )
 
 
+def test_specialization_cache_dedup(test, device):
+    """Two SolverSPH instances with matching has_dummies must share the same cached kernel objects."""
+
+    # Factory-level check: same flag → same object via fem.cache.dynamic_kernel memoization.
+    k_true_a = make_compute_density_kernel(True)
+    k_true_b = make_compute_density_kernel(True)
+    k_false = make_compute_density_kernel(False)
+    test.assertIs(k_true_a, k_true_b, "density kernel cache miss on repeated True call")
+    test.assertIsNot(k_true_a, k_false, "True and False variants collapsed into one kernel")
+
+    # Spot-check two more kernels to confirm the pattern.
+    test.assertIs(
+        make_compute_velocity_gradient_kernel(True),
+        make_compute_velocity_gradient_kernel(True),
+    )
+    test.assertIs(
+        make_compute_stress_force_kernel(False),
+        make_compute_stress_force_kernel(False),
+    )
+
+    # Solver-level check: two solvers built from identical builders must share kernels.
+    def _build_fluid_only_solver():
+        builder = newton.ModelBuilder()
+        SolverSPH.register_custom_attributes(builder)
+        builder.add_particle_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=2,
+            dim_y=2,
+            dim_z=2,
+            cell_x=0.05,
+            cell_y=0.05,
+            cell_z=0.05,
+            mass=0.1,
+            jitter=0.0,
+        )
+        model = builder.finalize(device=device)
+        return SolverSPH(model, SolverSPH.Config())
+
+    solver_a = _build_fluid_only_solver()
+    solver_b = _build_fluid_only_solver()
+    test.assertFalse(solver_a._has_dummies, "fluid-only scene flagged as has_dummies")
+    test.assertIs(solver_a._density_kernel, solver_b._density_kernel)
+    test.assertIs(solver_a._velocity_gradient_kernel, solver_b._velocity_gradient_kernel)
+    test.assertIs(solver_a._stress_force_kernel, solver_b._stress_force_kernel)
+    test.assertIs(solver_a._artificial_viscosity_kernel, solver_b._artificial_viscosity_kernel)
+    test.assertIs(solver_a._xsph_kernel, solver_b._xsph_kernel)
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -428,6 +483,13 @@ add_function_test(
     TestSPH,
     "test_sand_cube_position_verlet",
     test_sand_cube_position_verlet,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_specialization_cache_dedup",
+    test_specialization_cache_dedup,
     devices=devices,
     check_output=False,
 )

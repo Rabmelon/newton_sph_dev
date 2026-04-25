@@ -41,15 +41,15 @@ from .sph_constitutive import (
 )
 from .sph_dummy_boundary import add_dummy_particles_to_builder
 from .sph_kernels import (
-    compute_artificial_viscosity_kernel,
-    compute_density_kernel,
     compute_strain_rate_kernel,
-    compute_stress_force_kernel,
-    compute_velocity_gradient_kernel,
     half_step_position_kernel,
     integrate_symplectic_euler_kernel,
     integrate_verlet_final_kernel,
-    xsph_correction_kernel,
+    make_compute_artificial_viscosity_kernel,
+    make_compute_density_kernel,
+    make_compute_stress_force_kernel,
+    make_compute_velocity_gradient_kernel,
+    make_xsph_correction_kernel,
 )
 from .sph_model import SPHModel
 
@@ -315,6 +315,16 @@ class SolverSPH(SolverBase):
                     stacklevel=2,
                 )
                 self._fluid_count = n
+
+        # Specialize hot kernels on whether any dummy particles exist. Detection
+        # must not use ``_fluid_count < n`` because the non-contiguous fallback
+        # above forces ``_fluid_count = n`` even when dummies are present.
+        self._has_dummies = bool(np.any(pt != 0))
+        self._density_kernel = make_compute_density_kernel(self._has_dummies)
+        self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(self._has_dummies)
+        self._stress_force_kernel = make_compute_stress_force_kernel(self._has_dummies)
+        self._artificial_viscosity_kernel = make_compute_artificial_viscosity_kernel(self._has_dummies)
+        self._xsph_kernel = make_xsph_correction_kernel(self._has_dummies)
 
     def _extract_gravity_vec(self) -> wp.vec3:
         """Extract gravity as a :class:`wp.vec3` from the model array."""
@@ -585,7 +595,7 @@ class SolverSPH(SolverBase):
         src = density_prev_source if density_prev_source is not None else state.sph.density
         wp.copy(self._density_prev, src)
         wp.launch(
-            compute_density_kernel,
+            self._density_kernel,
             dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
@@ -613,7 +623,7 @@ class SolverSPH(SolverBase):
         positions = pos if pos is not None else state.particle_q
         velocities = vel if vel is not None else state.particle_qd
         wp.launch(
-            compute_velocity_gradient_kernel,
+            self._velocity_gradient_kernel,
             dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
@@ -742,7 +752,7 @@ class SolverSPH(SolverBase):
         rho = density if density is not None else state_in.sph.density
         gravity_vec = self._gravity_vec
         wp.launch(
-            compute_stress_force_kernel,
+            self._stress_force_kernel,
             dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
@@ -774,7 +784,7 @@ class SolverSPH(SolverBase):
         velocities = vel if vel is not None else state.particle_qd
         rho = density if density is not None else state.sph.density
         wp.launch(
-            compute_artificial_viscosity_kernel,
+            self._artificial_viscosity_kernel,
             dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
@@ -854,7 +864,7 @@ class SolverSPH(SolverBase):
     def _xsph_correction(self, state: newton.State) -> None:
         """Apply XSPH velocity smoothing correction in-place."""
         wp.launch(
-            xsph_correction_kernel,
+            self._xsph_kernel,
             dim=self._fluid_count,
             inputs=[
                 self._hash_grid.id,
