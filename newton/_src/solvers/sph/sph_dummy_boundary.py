@@ -178,8 +178,8 @@ def generate_dummy_particles(
     # Extended ranges that include the dummy layer region, covering edges
     # and corners.  Priority: ±X covers all edges/corners it touches,
     # ±Y covers remaining Z-edges, ±Z uses interior ranges only.
-    ys_ext = np.arange(lo[1] - thickness, hi[1] + thickness + 0.5 * dx, dx, dtype=np.float32)
-    zs_ext = np.arange(lo[2] - thickness, hi[2] + thickness + 0.5 * dx, dx, dtype=np.float32)
+    # ys_ext = np.arange(lo[1] - thickness, hi[1] + thickness + 0.5 * dx, dx, dtype=np.float32)
+    # zs_ext = np.arange(lo[2] - thickness, hi[2] + thickness + 0.5 * dx, dx, dtype=np.float32)
 
     positions: list[np.ndarray] = []
     normals: list[np.ndarray] = []
@@ -199,11 +199,11 @@ def generate_dummy_particles(
     for layer in range(1, layer_count + 1):
         off = float(layer) * dx
         # ±X faces use extended y and z (covers X-edges and all 8 corners)
-        _add_plane(0, 1.0, float(lo[0] - off), ys_ext, zs_ext)
-        _add_plane(0, -1.0, float(hi[0] + off), ys_ext, zs_ext)
+        # _add_plane(0, 1.0, float(lo[0] - off), ys_ext, zs_ext)
+        # _add_plane(0, -1.0, float(hi[0] + off), ys_ext, zs_ext)
         # ±Y faces use interior x, extended z (covers Y-Z edges)
-        _add_plane(1, 1.0, float(lo[1] - off), xs, zs_ext)
-        _add_plane(1, -1.0, float(hi[1] + off), xs, zs_ext)
+        # _add_plane(1, 1.0, float(lo[1] - off), xs, zs_ext)
+        # _add_plane(1, -1.0, float(hi[1] + off), xs, zs_ext)
         # ±Z faces use interior x and y (edges/corners already covered)
         _add_plane(2, 1.0, float(lo[2] - off), xs, ys)
         # _add_plane(2, -1.0, float(hi[2] + off), xs, ys)

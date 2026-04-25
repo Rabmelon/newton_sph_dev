@@ -22,6 +22,7 @@ class Example:
         self.fps = args.fps
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
+        self.sim_step = 0
         # Simulation duration (seconds)
         self.sim_duration = args.duration
         # How to behave when the simulation ends
@@ -108,8 +109,9 @@ class Example:
     def step(self):
         self.simulate()
         self.sim_time += self.frame_dt
+        self.sim_step += self.sim_substeps
         # Print simulation progress to the command line
-        print(f"sim step: {getattr(self, 'step_count', 0)}, time: {self.sim_time:.6f}s", flush=True)
+        print(f"sim step: {self.sim_step:6d}, time: {self.sim_time:.6f}s", flush=True)
 
         # Check if we've reached or exceeded the target duration
         if self.sim_time >= self.sim_duration:
@@ -119,8 +121,8 @@ class Example:
                     self.viewer.should_close = True
 
         # Additionally stop the simulation once 0.1 seconds of simulated time is reached
-        if self.sim_time >= 0.1:
-            raise SystemExit("Reached 0.1s of simulated time, stopping simulation.")
+        if self.sim_time >= self.sim_duration:
+            raise SystemExit(f"Reached {self.sim_duration}s of simulated time, stopping simulation.")
 
     def test_final(self):
         h = self.solver.smoothing_length
@@ -198,7 +200,7 @@ class Example:
         # dt_CFL = 0.3 * h / c_s (e.g. ≈ 0.039 ms for default dx=0.005, c_s=50).
         parser.add_argument("--substeps", type=int, default=None)
         # Simulation duration and end-of-run behavior
-        parser.add_argument("--duration", type=float, default=0.1, help="Simulation duration in seconds")
+        parser.add_argument("--duration", type=float, default=0.5, help="Simulation duration in seconds")
         parser.add_argument(
             "--end-behavior",
             type=str,

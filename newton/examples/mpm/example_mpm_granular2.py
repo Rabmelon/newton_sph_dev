@@ -8,7 +8,7 @@ This example mirrors the SPH granular column collapse setup
 
 A cylindrical column of granular material is initialized on a regular
 Cartesian grid and filtered by the cylinder geometry. The resulting
-particles are simulated with a Drucker–Prager type elastoplastic
+particles are simulated with a Drucker-Prager type elastoplastic
 constitutive model using the implicit MPM solver.
 """
 
@@ -31,6 +31,8 @@ class Example:
         self.sim_substeps = args.substeps
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.step_count = 0
+        # Simulation duration (seconds)
+        self.sim_duration = args.duration
 
         # viewer / model builder
         self.viewer = viewer
@@ -102,12 +104,36 @@ class Example:
         self.sim_time += self.frame_dt
         self.step_count += self.sim_substeps
 
+        # Per-step particle statistics
+        # - run-out distance: max sqrt(x^2 + y^2)
+        # - max height: max z
+        # - total kinetic energy: sum(0.5 * m * |v|^2)
+        # Note: we compute this on CPU for simplicity (example output).
+        q_np = self.state_0.particle_q.numpy()
+        qd_np = self.state_0.particle_qd.numpy()
+        runout = float(np.max(np.sqrt(q_np[:, 0] ** 2 + q_np[:, 1] ** 2))) if q_np.size else 0.0
+        max_h = float(np.max(q_np[:, 2])) if q_np.size else 0.0
+
+        m_arr = getattr(self.model, "particle_mass", None)
+        if m_arr is not None:
+            m_np = m_arr.numpy().reshape(-1)
+            if m_np.size == qd_np.shape[0]:
+                ke = float(0.5 * np.sum(m_np * np.sum(qd_np * qd_np, axis=1)))
+            else:
+                ke = float(0.5 * np.sum(np.sum(qd_np * qd_np, axis=1)))
+        else:
+            ke = float(0.5 * np.sum(np.sum(qd_np * qd_np, axis=1)))
+
         # Print simulation progress to the command line
-        print(f"sim step: {self.step_count}, time: {self.sim_time:.6f}s", flush=True)
+        print(
+            f"sim step: {self.step_count}, time: {self.sim_time:.6f}s, "
+            f"runout: {runout:.6f}m, max_h: {max_h:.6f}m, KE: {ke:.6f}J",
+            flush=True,
+        )
 
         # Stop the simulation after 0.1 seconds of simulated time
-        if self.sim_time >= 0.1:
-            raise SystemExit("Reached 0.1s of simulated time, stopping simulation.")
+        if self.sim_time >= self.sim_duration:
+            raise SystemExit(f"Reached {self.sim_duration}s of simulated time, stopping simulation.")
 
         # Expose simulation info to the viewer so it can be shown in the
         # top-right performance panel (increments and time).
@@ -225,6 +251,7 @@ class Example:
         parser.add_argument("--gravity", type=float, nargs=3, default=[0.0, 0.0, -9.81])
         parser.add_argument("--fps", type=float, default=60.0)
         parser.add_argument("--substeps", type=int, default=1)
+        parser.add_argument("--duration", type=float, default=0.5, help="Simulation duration in seconds")
 
         # Particle resolution
         parser.add_argument("--particle-spacing", "-dx", type=float, default=0.005)
@@ -256,7 +283,7 @@ class Example:
         parser.add_argument("--transfer-scheme", "-ts", type=str, default="apic", choices=["apic", "pic"])
         parser.add_argument("--integration-scheme", "-is", type=str, default="pic", choices=["pic", "gimp"])
 
-        parser.add_argument("--strain-basis", "-sb", type=str, default="P0")
+        parser.add_argument("--strain-basis", "-sb", type=str, default="P1d")
         parser.add_argument("--collider-basis", "-cb", type=str, default="Q1")
         parser.add_argument("--velocity-basis", "-vb", type=str, default="Q1")
 
