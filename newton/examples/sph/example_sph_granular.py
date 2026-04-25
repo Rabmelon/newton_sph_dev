@@ -110,8 +110,33 @@ class Example:
         self.simulate()
         self.sim_time += self.frame_dt
         self.sim_step += self.sim_substeps
+
+        # Per-step particle statistics (mirrors example_mpm_granular2.py for benchmarking)
+        # - run-out distance: max sqrt(x^2 + y^2)
+        # - max height: max z
+        # - total kinetic energy: sum(0.5 * m * |v|^2)
+        # Restricted to fluid particles so dummy boundary particles (if any) don't pollute stats.
+        q_np = self.state_0.particle_q.numpy()[: self.fluid_count]
+        qd_np = self.state_0.particle_qd.numpy()[: self.fluid_count]
+        runout = float(np.max(np.sqrt(q_np[:, 0] ** 2 + q_np[:, 1] ** 2))) if q_np.size else 0.0
+        max_h = float(np.max(q_np[:, 2])) if q_np.size else 0.0
+
+        m_arr = getattr(self.model, "particle_mass", None)
+        if m_arr is not None:
+            m_np = m_arr.numpy().reshape(-1)[: self.fluid_count]
+            if m_np.size == qd_np.shape[0]:
+                ke = float(0.5 * np.sum(m_np * np.sum(qd_np * qd_np, axis=1)))
+            else:
+                ke = float(0.5 * np.sum(np.sum(qd_np * qd_np, axis=1)))
+        else:
+            ke = float(0.5 * np.sum(np.sum(qd_np * qd_np, axis=1)))
+
         # Print simulation progress to the command line
-        print(f"sim step: {self.sim_step:6d}, time: {self.sim_time:.6f}s", flush=True)
+        print(
+            f"sim step: {self.sim_step:6d}, time: {self.sim_time:.6f}s, "
+            f"runout: {runout:.6f}m, max_h: {max_h:.6f}m, KE: {ke:.6f}J",
+            flush=True,
+        )
 
         # Check if we've reached or exceeded the target duration
         if self.sim_time >= self.sim_duration:
