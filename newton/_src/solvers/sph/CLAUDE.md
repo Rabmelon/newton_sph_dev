@@ -237,8 +237,25 @@ and re-checked in each `_step_*` via `else: raise`.
 > currently says "Density is computed by direct summation; there is
 > no continuity equation, Shepard filter, or δ-SPH term." The
 > Shepard filter was added in commit `ebb4fbe9` and is now the
-> default density path. δ-SPH is still absent. If you edit density,
-> preserve Shepard + its dummy-substitution branch.
+> default density path. If you edit density, preserve Shepard + its
+> dummy-substitution branch.
+
+### Optional δ-SPH-equivalent smoothing pass
+
+`make_smooth_density_kernel(has_dummies)` (`sph_kernels.py`) provides
+an optional Marrone-style post-summation density smoothing pass, gated
+on `Config.density_smoothing_delta ∈ [0, 1]` (default `0.0` → skipped).
+When active, it computes a Shepard-normalized smoothed estimate
+`ρ̃_i = Σ_j m_j W_ij / Σ_j (m_j / ρ_j) W_ij` and blends
+`ρ_out = (1 − δ) · ρ_in + δ · ρ̃`. Dummy neighbors substitute
+`ρ_j ← reference_density` (same branch as the main density kernel).
+The smoothing kernel self-includes `j == i` per §6 density exception.
+The pass runs once per substep in both Symplectic Euler and
+Position-Verlet paths (`solver_sph.py:_smooth_density`); on Verlet it
+operates on the midpoint density. Canonical Antuono / Marrone δ-SPH
+based on `dρ/dt + δ-term` is **not** applicable here because Newton
+recomputes density via fresh Shepard summation; this pass is the
+formulation-equivalent stabilizer.
 
 ## 9. Boundary treatments
 

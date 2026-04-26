@@ -49,6 +49,7 @@ from .sph_kernels import (
     make_compute_density_kernel,
     make_compute_stress_force_kernel,
     make_compute_velocity_gradient_kernel,
+    make_smooth_density_kernel,
     make_xsph_correction_kernel,
 )
 from .sph_model import SPHModel
@@ -119,6 +120,15 @@ class SolverSPH(SolverBase):
         # --- Corrections ---
         xsph_epsilon: float = 0.0
         """XSPH velocity smoothing factor (0 = off, 1 = full)."""
+        density_smoothing_delta: float = 0.0
+        """Density-field smoothing blend factor [-]; ``0.0`` disables the pass.
+
+        When ``> 0``, after the per-substep Shepard density summation, run one
+        extra MLS-like smoothing pass and blend ``rho_out = (1-delta)*rho_in
+        + delta*rho_tilde``. Equivalent in spirit to delta-SPH for Newton's
+        summation density. Recommended range 0.05-0.2 (Antuono 2010 / Marrone
+        2011 analog).
+        """
 
         # --- Granular damping ---
         viscous_damping: float = 0.0
@@ -142,6 +152,8 @@ class SolverSPH(SolverBase):
                 raise ValueError(
                     f"Invalid boundary_type: {self.boundary_type}. Must be one of {supported_boundary_types}."
                 )
+            if not (0.0 <= self.density_smoothing_delta <= 1.0):
+                raise ValueError(f"density_smoothing_delta must be in [0, 1]; got {self.density_smoothing_delta}")
 
     @classmethod
     def register_custom_attributes(cls, builder: newton.ModelBuilder) -> None:
@@ -321,10 +333,17 @@ class SolverSPH(SolverBase):
         # above forces ``_fluid_count = n`` even when dummies are present.
         self._has_dummies = bool(np.any(pt != 0))
         self._density_kernel = make_compute_density_kernel(self._has_dummies)
+        self._smooth_density_kernel = make_smooth_density_kernel(self._has_dummies)
         self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(self._has_dummies)
         self._stress_force_kernel = make_compute_stress_force_kernel(self._has_dummies)
         self._artificial_viscosity_kernel = make_compute_artificial_viscosity_kernel(self._has_dummies)
         self._xsph_kernel = make_xsph_correction_kernel(self._has_dummies)
+
+        # Scratch for optional Marrone-style density smoothing pass.
+        if config.density_smoothing_delta > 0.0:
+            self._density_smooth = wp.zeros(n, dtype=float, device=model.device)
+        else:
+            self._density_smooth = None
 
     def _extract_gravity_vec(self) -> wp.vec3:
         """Extract gravity as a :class:`wp.vec3` from the model array."""
@@ -426,6 +445,8 @@ class SolverSPH(SolverBase):
 
         # 2. Compute density (stored on state_in for use during force computation)
         self._compute_density(state_in)
+        # 2b. Optional Marrone-style smoothing pass (no-op when delta == 0).
+        self._smooth_density(state_in)
 
         # 3. Zero acceleration (cudaMemset is cheaper than a kernel launch)
         self._accel.zero_()
@@ -495,6 +516,8 @@ class SolverSPH(SolverBase):
         # 3. Compute density at midpoint -> write to state_out
         #    Use state_in density as Shepard correction reference (not stale state_out)
         self._compute_density(state_out, pos=self._pos_mid, density_prev_source=state_in.sph.density)
+        # 3b. Optional Marrone-style smoothing pass on midpoint density (no-op when delta == 0).
+        self._smooth_density(state_out, pos=self._pos_mid, density_field=state_out.sph.density)
 
         # 4. Zero acceleration
         self._accel.zero_()
@@ -611,6 +634,52 @@ class SolverSPH(SolverBase):
             outputs=[state.sph.density],
             device=self.model.device,
         )
+
+    def _smooth_density(
+        self,
+        state: newton.State,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+        density_field: wp.array[float] | None = None,
+    ) -> None:
+        """Apply one Shepard-normalized density smoothing pass in place.
+
+        No-op when ``Config.density_smoothing_delta == 0.0``.
+
+        Args:
+            state: State containing the positions used by the hash grid.
+            pos: Override positions (e.g. midpoint for Verlet); defaults to
+                ``state.particle_q``.
+            density_field: Density array to smooth in place. Defaults to
+                ``state.sph.density``.
+        """
+        delta = self._config.density_smoothing_delta
+        if delta <= 0.0:
+            return
+
+        positions = pos if pos is not None else state.particle_q
+        rho = density_field if density_field is not None else state.sph.density
+
+        # Ping-pong: read from ``rho``, write into scratch, then copy back.
+        wp.launch(
+            self._smooth_density_kernel,
+            dim=self._fluid_count,
+            inputs=[
+                self._hash_grid.id,
+                positions,
+                self.model.particle_mass,
+                rho,
+                self.model.particle_flags,
+                self._particle_type,
+                self._h,
+                self._support_radius,
+                self._config.reference_density,
+                delta,
+            ],
+            outputs=[self._density_smooth],
+            device=self.model.device,
+        )
+        wp.copy(rho, self._density_smooth)
 
     def _compute_velocity_gradient(
         self,

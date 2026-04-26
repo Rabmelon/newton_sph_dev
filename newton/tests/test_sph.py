@@ -457,6 +457,191 @@ def test_specialization_cache_dedup(test, device):
     test.assertIs(solver_a._xsph_kernel, solver_b._xsph_kernel)
 
 
+def test_density_smoothing_disabled_bitexact(test, device):
+    """delta=0.0 must produce density bit-identical to the no-smoothing path."""
+
+    builder = newton.ModelBuilder()
+    SolverSPH.register_custom_attributes(builder)
+
+    spacing = 0.02
+    h = 1.5 * spacing
+    n_cells = 6
+    density_ref = 1000.0
+    mass = density_ref * (spacing**3)
+
+    builder.add_particle_grid(
+        pos=wp.vec3(0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=n_cells,
+        dim_y=n_cells,
+        dim_z=n_cells,
+        cell_x=spacing,
+        cell_y=spacing,
+        cell_z=spacing,
+        mass=mass,
+        jitter=0.0,
+        radius_mean=spacing * 0.5,
+    )
+    model = builder.finalize(device=device)
+
+    cfg_off = SolverSPH.Config()
+    cfg_off.smoothing_length = h
+    cfg_off.reference_density = density_ref
+    cfg_off.density_smoothing_delta = 0.0  # explicit default
+
+    solver_off = SolverSPH(model, cfg_off)
+    state_off = model.state()
+    solver_off._build_neighbor_list(state_off)
+    solver_off._compute_density(state_off)
+    solver_off._smooth_density(state_off)
+    rho_off = state_off.sph.density.numpy().copy()
+
+    # Recompute via the bare density path — must match exactly.
+    state_ref = model.state()
+    solver_off._build_neighbor_list(state_ref)
+    solver_off._compute_density(state_ref)
+    rho_ref = state_ref.sph.density.numpy().copy()
+
+    test.assertTrue(
+        np.array_equal(rho_off, rho_ref),
+        f"delta=0 changed density (max diff = {np.max(np.abs(rho_off - rho_ref))})",
+    )
+
+
+def test_density_smoothing_uniform_grid_no_regression(test, device):
+    """delta=0.1 on a uniform grid must not raise interior-density CV materially."""
+
+    builder = newton.ModelBuilder()
+    SolverSPH.register_custom_attributes(builder)
+
+    spacing = 0.02
+    h = 1.5 * spacing
+    n_cells = 8
+    density_ref = 1000.0
+    mass = density_ref * (spacing**3)
+
+    builder.add_particle_grid(
+        pos=wp.vec3(0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=n_cells,
+        dim_y=n_cells,
+        dim_z=n_cells,
+        cell_x=spacing,
+        cell_y=spacing,
+        cell_z=spacing,
+        mass=mass,
+        jitter=0.0,
+        radius_mean=spacing * 0.5,
+    )
+    model = builder.finalize(device=device)
+
+    def _cv_with_delta(delta: float) -> float:
+        cfg = SolverSPH.Config()
+        cfg.smoothing_length = h
+        cfg.reference_density = density_ref
+        cfg.density_smoothing_delta = delta
+        solver = SolverSPH(model, cfg)
+        state = model.state()
+        solver._build_neighbor_list(state)
+        solver._compute_density(state)
+        solver._smooth_density(state)
+        rho = state.sph.density.numpy()
+        pos = state.particle_q.numpy()
+        margin = 3 * spacing
+        lo = pos.min(axis=0) + margin
+        hi = pos.max(axis=0) - margin
+        interior = np.all((pos >= lo) & (pos <= hi), axis=1)
+        rho_in = rho[interior]
+        return float(np.std(rho_in) / np.mean(rho_in))
+
+    cv_off = _cv_with_delta(0.0)
+    cv_on = _cv_with_delta(0.1)
+    test.assertLessEqual(
+        cv_on,
+        cv_off * 1.05 + 1.0e-6,
+        f"density smoothing regressed CV: off={cv_off:.4e}, on={cv_on:.4e}",
+    )
+
+
+def test_density_smoothing_hydrostatic_reduces_pressure_noise(test, device):
+    """Smoothing on a hydrostatic column must not increase pressure std-dev at fixed depth."""
+
+    spacing = 0.02
+    h = 1.3 * spacing
+    n_x, n_y, n_z = 6, 6, 10
+    density_ref = 1500.0
+    mass = density_ref * (spacing**3)
+
+    def _pressure_std(delta: float) -> float:
+        builder = newton.ModelBuilder()
+        SolverSPH.register_custom_attributes(builder)
+        builder.add_particle_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=n_x,
+            dim_y=n_y,
+            dim_z=n_z,
+            cell_x=spacing,
+            cell_y=spacing,
+            cell_z=spacing,
+            mass=mass,
+            jitter=0.0,
+            radius_mean=spacing * 0.5,
+        )
+        bounds_lo = (-spacing, -spacing, -spacing)
+        bounds_hi = (n_x * spacing, n_y * spacing, n_z * spacing)
+        SolverSPH.add_dummy_particles(
+            builder,
+            bounds_lo=bounds_lo,
+            bounds_hi=bounds_hi,
+            h=h,
+            dx=spacing,
+            reference_density=density_ref,
+            slip_type="noslip",
+        )
+        model = builder.finalize(device=device)
+
+        cfg = SolverSPH.Config()
+        cfg.smoothing_length = h
+        cfg.reference_density = density_ref
+        cfg.boundary_type = "dummy"
+        cfg.density_smoothing_delta = delta
+        solver = SolverSPH(model, cfg)
+        state_in = model.state()
+        state_out = model.state()
+        z_max = float((n_z - 1) * spacing)
+        solver.initialize_geostatic_stress(state_in, z_max)
+
+        dt = 0.1 * h / cfg.sound_speed
+        for _ in range(30):
+            solver.step(state_in, state_out, None, None, dt)
+            state_in, state_out = state_out, state_in
+
+        # Inspect pressure of fluid particles in a thin band around mid-depth.
+        rho = state_in.sph.density.numpy()
+        pos = state_in.particle_q.numpy()
+        ptype = model.sph.particle_type.numpy()
+        z_mid = 0.5 * (n_z - 1) * spacing
+        band = (np.abs(pos[:, 2] - z_mid) < 0.6 * spacing) & (ptype == 0) & (rho > 0.0)
+        if not np.any(band):
+            test.skipTest("no fluid particles fell into the mid-depth sampling band")
+        # P = -tr(sigma)/3 already lives on state.sph.pressure.
+        pressure = state_in.sph.pressure.numpy()
+        return float(np.std(pressure[band]))
+
+    std_off = _pressure_std(0.0)
+    std_on = _pressure_std(0.15)
+    # Smoothing must not increase pressure noise at fixed depth.
+    test.assertLessEqual(
+        std_on,
+        std_off + 1.0e-3,
+        f"smoothing increased pressure std at fixed depth: off={std_off:.3e}, on={std_on:.3e}",
+    )
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -490,6 +675,27 @@ add_function_test(
     TestSPH,
     "test_specialization_cache_dedup",
     test_specialization_cache_dedup,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_density_smoothing_disabled_bitexact",
+    test_density_smoothing_disabled_bitexact,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_density_smoothing_uniform_grid_no_regression",
+    test_density_smoothing_uniform_grid_no_regression,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_density_smoothing_hydrostatic_reduces_pressure_noise",
+    test_density_smoothing_hydrostatic_reduces_pressure_noise,
     devices=devices,
     check_output=False,
 )

@@ -717,6 +717,72 @@ def make_compute_density_kernel(has_dummies: bool):
     return compute_density_kernel_impl
 
 
+def make_smooth_density_kernel(has_dummies: bool):
+    """Factory for a post-summation density smoothing kernel.
+
+    Performs one Shepard-normalized smoothed estimate of density and blends it
+    with the input density field via ``delta_smooth in [0, 1]``.
+    """
+
+    @fem.cache.dynamic_kernel(
+        suffix=has_dummies,
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
+    )
+    def smooth_density_kernel_impl(
+        grid: wp.uint64,
+        pos: wp.array[wp.vec3],
+        mass: wp.array[float],
+        density_in: wp.array[float],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        h: float,
+        support_radius: float,
+        reference_density: float,
+        delta_smooth: float,
+        density_out: wp.array[float],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            return
+        if particle_type[i] != SPH_FLUID:
+            return
+
+        # Bootstrap-step gate: skip when input density is degenerate.
+        rho_i_in = density_in[i]
+        if rho_i_in < _EPSILON:
+            density_out[i] = rho_i_in
+            return
+
+        xi = pos[i]
+        num = float(0.0)  # sum_j m_j W_ij
+        denom = float(0.0)  # sum_j (m_j / rho_j) W_ij — Shepard normalizer
+
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        j = int(0)
+        while wp.hash_grid_query_next(query, j):
+            if (particle_flags[j] & ParticleFlags.ACTIVE) != 0:
+                xj = pos[j]
+                r_vec = xi - xj
+                r = wp.length(r_vec)
+                if r < support_radius:
+                    W = wendland_c2_3d(r, h)
+                    rho_j = density_in[j]
+                    if wp.static(has_dummies):
+                        if particle_type[j] != SPH_FLUID:
+                            rho_j = reference_density
+                    num += mass[j] * W
+                    if rho_j > _EPSILON:
+                        denom += (mass[j] / rho_j) * W
+
+        if denom > _EPSILON:
+            rho_tilde = num / denom
+            density_out[i] = (1.0 - delta_smooth) * rho_i_in + delta_smooth * rho_tilde
+        else:
+            density_out[i] = rho_i_in
+
+    return smooth_density_kernel_impl
+
+
 def make_compute_velocity_gradient_kernel(has_dummies: bool):
     """Factory for a velocity-gradient kernel specialized on ``has_dummies``."""
 

@@ -33,6 +33,7 @@
 - Add `total_force_friction` and `force_matrix_friction` to `SensorContact` for tangential (friction) force decomposition
 - Add `compute_normals` and `compute_uvs` optional arguments to `Mesh.create_heightfield()` and `Mesh.create_terrain()`
 - Add RJ45 plug-socket insertion example with SDF contacts, latch joint, and interactive gizmo
+- Add optional Marrone-style density smoothing pass to `SolverSPH`, controlled by `SolverSPH.Config.density_smoothing_delta` (default `0.0`, disabled). Equivalent in spirit to delta-SPH for Newton's Shepard-summation density formulation.
 
 ### Changed
 
