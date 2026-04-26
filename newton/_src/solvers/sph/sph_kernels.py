@@ -783,11 +783,87 @@ def make_smooth_density_kernel(has_dummies: bool):
     return smooth_density_kernel_impl
 
 
-def make_compute_velocity_gradient_kernel(has_dummies: bool):
-    """Factory for a velocity-gradient kernel specialized on ``has_dummies``."""
+def make_compute_kernel_correction_kernel(has_dummies: bool):
+    """Factory for a per-particle kernel-gradient correction-matrix kernel.
+
+    Computes ``L_i = M'_i^{-1}`` where::
+
+        M'_i = sum_j (m_j / rho_j) ∇W_ij ⊗ (x_j - x_i)
+
+    so that the corrected gradient ``L_i ∇W_ij`` integrates linear functions
+    exactly under particle disorder. Falls back to identity when
+    ``|det(M'_i)| < eps_det`` (free surfaces, sparse-neighbor regions).
+    Bonet-Lok 1999 / Bui et al. 2008.
+
+    Self-inclusion of ``j == i`` is rejected because ``r_vec = 0`` contributes
+    a zero dyad; this differs from the density kernel where ``W(0, h) != 0``.
+    """
 
     @fem.cache.dynamic_kernel(
         suffix=has_dummies,
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
+    )
+    def compute_kernel_correction_kernel_impl(
+        grid: wp.uint64,
+        pos: wp.array[wp.vec3],
+        mass: wp.array[float],
+        density: wp.array[float],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        h: float,
+        support_radius: float,
+        reference_density: float,
+        eps_det: float,
+        kernel_grad_correction: wp.array[wp.mat33],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            kernel_grad_correction[i] = wp.identity(n=3, dtype=float)
+            return
+        if particle_type[i] != SPH_FLUID:
+            kernel_grad_correction[i] = wp.identity(n=3, dtype=float)
+            return
+
+        xi = pos[i]
+        M = wp.mat33(0.0)
+
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        j = int(0)
+        while wp.hash_grid_query_next(query, j):
+            if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and j != i:
+                xj = pos[j]
+                r_vec = xi - xj
+                r = wp.length(r_vec)
+                if r < support_radius and r > _EPSILON:
+                    rho_j = density[j]
+                    if wp.static(has_dummies):
+                        if particle_type[j] != SPH_FLUID:
+                            rho_j = reference_density
+                    if rho_j > _EPSILON:
+                        grad_w = wendland_c2_grad_3d(r_vec, r, h)
+                        M += (mass[j] / rho_j) * wp.outer(grad_w, -r_vec)
+
+        if wp.abs(wp.determinant(M)) < eps_det:
+            kernel_grad_correction[i] = wp.identity(n=3, dtype=float)
+        else:
+            kernel_grad_correction[i] = wp.inverse(M)
+
+    return compute_kernel_correction_kernel_impl
+
+
+def make_compute_velocity_gradient_kernel(has_dummies: bool, apply_correction: bool = False):
+    """Factory for a velocity-gradient kernel specialized on ``has_dummies`` and ``apply_correction``.
+
+    When ``apply_correction`` is True, the per-pair gradient ``∇W_ij`` is
+    left-multiplied by the per-particle correction matrix
+    ``L_i = kernel_grad_correction[i]`` to restore first-order kernel-gradient
+    consistency under particle disorder (Bonet-Lok 1999; Bui et al. 2008).
+    Default ``False`` emits a kernel bit-identical to the unmodified pair
+    gradient.
+    """
+
+    @fem.cache.dynamic_kernel(
+        suffix=(has_dummies, apply_correction),
         kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
     )
     def compute_velocity_gradient_kernel_impl(
@@ -799,6 +875,7 @@ def make_compute_velocity_gradient_kernel(has_dummies: bool):
         particle_flags: wp.array[wp.int32],
         particle_type: wp.array[wp.int32],
         wall_normal: wp.array[wp.vec3],
+        kernel_grad_correction: wp.array[wp.mat33],
         h: float,
         support_radius: float,
         dummy_beta: float,
@@ -833,6 +910,8 @@ def make_compute_velocity_gradient_kernel(has_dummies: bool):
                             rho_j = reference_density
                     if rho_j > _EPSILON:
                         grad_w = wendland_c2_grad_3d(r_vec, r, h)
+                        if wp.static(apply_correction):
+                            grad_w = kernel_grad_correction[i] @ grad_w
                         v_diff = vj - vi
                         L += (mass[j] / rho_j) * wp.outer(v_diff, grad_w)
 

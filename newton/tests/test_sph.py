@@ -642,6 +642,124 @@ def test_density_smoothing_hydrostatic_reduces_pressure_noise(test, device):
     )
 
 
+def test_kernel_correction_disabled_default(test, device):
+    """Default ('none') skips correction kernel and leaves grad_correction zero."""
+
+    spacing = 0.02
+    kh = 1.5
+    n_cells = 6
+    density_ref = 1000.0
+    mass = density_ref * (spacing**3)
+
+    builder = newton.ModelBuilder()
+    SolverSPH.register_custom_attributes(builder)
+    builder.add_particle_grid(
+        pos=wp.vec3(0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=n_cells,
+        dim_y=n_cells,
+        dim_z=n_cells,
+        cell_x=spacing,
+        cell_y=spacing,
+        cell_z=spacing,
+        mass=mass,
+        jitter=0.0,
+        radius_mean=spacing * 0.5,
+    )
+    model = builder.finalize(device=device)
+
+    cfg = SolverSPH.Config()
+    cfg.particle_spacing = spacing
+    cfg.kh = kh
+    cfg.reference_density = density_ref
+    # default kernel_gradient_correction == "none"
+    solver = SolverSPH(model, cfg)
+    test.assertFalse(solver._use_kernel_correction)
+    test.assertIsNone(solver._kernel_correction_kernel)
+
+    state = model.state()
+    solver._build_neighbor_list(state)
+    solver._compute_density(state)
+    solver._compute_kernel_correction(state)
+    corr = state.sph.kernel_grad_correction.numpy()
+    test.assertEqual(np.count_nonzero(corr), 0, "no-op correction must not write")
+
+
+def test_kernel_correction_static_disorder(test, device):
+    """On a disordered grid, MLS correction must recover a linear velocity field."""
+
+    spacing = 0.02
+    kh = 1.5
+    n_cells = 10
+    density_ref = 1000.0
+    mass = density_ref * (spacing**3)
+    jitter = 0.3 * spacing
+
+    A = np.array(
+        [[0.10, 0.05, 0.00], [-0.02, 0.00, 0.07], [0.03, 0.04, -0.01]],
+        dtype=np.float32,
+    )
+
+    def _run(correction_mode: str) -> tuple[np.ndarray, np.ndarray]:
+        builder = newton.ModelBuilder()
+        SolverSPH.register_custom_attributes(builder)
+        builder.add_particle_grid(
+            pos=wp.vec3(0.0),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.0),
+            dim_x=n_cells,
+            dim_y=n_cells,
+            dim_z=n_cells,
+            cell_x=spacing,
+            cell_y=spacing,
+            cell_z=spacing,
+            mass=mass,
+            jitter=jitter,
+            radius_mean=spacing * 0.5,
+        )
+        model = builder.finalize(device=device)
+
+        cfg = SolverSPH.Config()
+        cfg.particle_spacing = spacing
+        cfg.kh = kh
+        cfg.reference_density = density_ref
+        cfg.kernel_gradient_correction = correction_mode
+        solver = SolverSPH(model, cfg)
+
+        state = model.state()
+        pos = state.particle_q.numpy()
+        vel = (pos @ A.T).astype(np.float32)
+        state.particle_qd.assign(vel)
+
+        # Density iterations: 1st falls back to raw summation, 2nd uses raw as
+        # density_prev so Shepard normalises to the converged interior value.
+        solver._build_neighbor_list(state)
+        for _ in range(2):
+            solver._compute_density(state)
+        solver._compute_kernel_correction(state)
+        solver._compute_velocity_gradient(state)
+        return state.sph.velocity_gradient.numpy(), pos
+
+    grad_off, pos_jit = _run("none")
+    grad_on, _ = _run("mls")
+
+    # Restrict to interior particles (margin >= support_radius) to avoid the
+    # singular-fallback band.
+    margin = 2.5 * kh * spacing
+    lo = pos_jit.min(axis=0) + margin
+    hi = pos_jit.max(axis=0) - margin
+    interior = np.all((pos_jit >= lo) & (pos_jit <= hi), axis=1)
+    test.assertGreater(np.sum(interior), 0, "no interior particles to test")
+
+    err_on = np.max(np.abs(grad_on[interior] - A[None, :, :]))
+    err_off = np.max(np.abs(grad_off[interior] - A[None, :, :]))
+    # MLS correction must recover A within tight tolerance.
+    test.assertLess(err_on, 5.0e-3, f"MLS did not recover A; err_on={err_on:.3e}")
+    # Uncorrected SPH on disordered grid must be materially worse.
+    test.assertGreater(err_off, err_on * 2.0, f"uncorrected too close: off={err_off:.3e}, on={err_on:.3e}")
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -696,6 +814,20 @@ add_function_test(
     TestSPH,
     "test_density_smoothing_hydrostatic_reduces_pressure_noise",
     test_density_smoothing_hydrostatic_reduces_pressure_noise,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_kernel_correction_disabled_default",
+    test_kernel_correction_disabled_default,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_kernel_correction_static_disorder",
+    test_kernel_correction_static_disorder,
     devices=devices,
     check_output=False,
 )

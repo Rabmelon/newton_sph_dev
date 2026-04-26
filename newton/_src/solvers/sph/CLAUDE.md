@@ -257,6 +257,40 @@ based on `dρ/dt + δ-term` is **not** applicable here because Newton
 recomputes density via fresh Shepard summation; this pass is the
 formulation-equivalent stabilizer.
 
+### Optional kernel-gradient correction (MLS)
+
+`make_compute_kernel_correction_kernel(has_dummies)` (`sph_kernels.py`)
+provides an optional first-order kernel-gradient consistency
+correction, gated on `Config.kernel_gradient_correction ∈ {"none",
+"mls"}` (default `"none"`). When active, computes a per-particle 3×3
+inverse renormalisation matrix
+`L_i = [Σ_j (m_j/ρ_j) ∇W_ij ⊗ (x_j − x_i)]^{−1}` stored in
+`State.sph.kernel_grad_correction`. Singular fallback to identity
+when `|det(M_i)| < Config.kernel_correction_det_floor` (default
+`1.0e-3`); typical at free surfaces and sparse-neighbor regions.
+Mirrors the density-kernel dummy-substitution branch
+(`ρ_j ← reference_density` for non-fluid `j`). Uses `j != i` — the
+gradient analog has no nonzero `j == i` term, unlike the density
+kernel exception (§6).
+
+`make_compute_velocity_gradient_kernel` takes a second factory key
+`apply_correction: bool`; when `True`, the per-pair gradient is
+left-multiplied `L_i ∇W_ij` inside the neighbor loop. Two compiled
+variants per `has_dummies` setting. With correction OFF the kernel is
+bit-identical to the unmodified pair-gradient sum.
+
+The pass runs once per substep in both Symplectic Euler and
+Position-Verlet paths, after density (and density-smoothing) and
+before velocity-gradient. On Verlet it operates on midpoint position
+and midpoint density.
+
+**Stress-force kernel is intentionally NOT corrected.** One-sided
+`L_i ∇W_ij` inside `make_compute_stress_force_kernel` would break
+the antisymmetric pair-force structure that guarantees momentum
+conservation by Newton's third law. Bonet-Lok 1999 §3 use a
+symmetrized form `½(L_i + L_j) ∇W_ij` to restore antisymmetry; that
+extension is deferred.
+
 ## 9. Boundary treatments
 
 Selected by `Config.boundary_type ∈ {"penalty", "dummy"}`.

@@ -47,6 +47,7 @@ from .sph_kernels import (
     integrate_verlet_final_kernel,
     make_compute_artificial_viscosity_kernel,
     make_compute_density_kernel,
+    make_compute_kernel_correction_kernel,
     make_compute_stress_force_kernel,
     make_compute_velocity_gradient_kernel,
     make_smooth_density_kernel,
@@ -129,6 +130,20 @@ class SolverSPH(SolverBase):
         summation density. Recommended range 0.05-0.2 (Antuono 2010 / Marrone
         2011 analog).
         """
+        kernel_gradient_correction: str = "none"
+        """Kernel-gradient consistency correction: ``'none'`` (default) or ``'mls'``.
+
+        When ``'mls'``, multiply pair gradients ``∇W_ij`` by per-particle inverse
+        renormalisation matrix ``L_i`` to restore first-order completeness inside
+        velocity-gradient computation (Bonet-Lok 1999 / Bui et al. 2008). Adds
+        one extra neighbor-loop pass per substep. Stress-force correction is
+        deferred to preserve momentum conservation (Newton's third law antisymmetry).
+        """
+        kernel_correction_det_floor: float = 1.0e-3
+        """Determinant threshold below which the per-particle correction matrix
+        falls back to identity (uncorrected gradient). Guards free-surface and
+        sparse-neighbor singularity. Only consulted when
+        ``kernel_gradient_correction != 'none'``."""
 
         # --- Granular damping ---
         viscous_damping: float = 0.0
@@ -154,6 +169,14 @@ class SolverSPH(SolverBase):
                 )
             if not (0.0 <= self.density_smoothing_delta <= 1.0):
                 raise ValueError(f"density_smoothing_delta must be in [0, 1]; got {self.density_smoothing_delta}")
+            supported_kernel_corrections = {"none", "mls"}
+            if self.kernel_gradient_correction not in supported_kernel_corrections:
+                raise ValueError(
+                    f"Invalid kernel_gradient_correction: {self.kernel_gradient_correction}. "
+                    f"Must be one of {supported_kernel_corrections}."
+                )
+            if self.kernel_correction_det_floor < 0.0:
+                raise ValueError(f"kernel_correction_det_floor must be >= 0; got {self.kernel_correction_det_floor}")
 
     @classmethod
     def register_custom_attributes(cls, builder: newton.ModelBuilder) -> None:
@@ -218,6 +241,7 @@ class SolverSPH(SolverBase):
             ("strain_rate", wp.mat33, wp.mat33(0.0)),
             ("velocity_gradient", wp.mat33, wp.mat33(0.0)),
             ("plastic_strain", wp.float32, 0.0),
+            ("kernel_grad_correction", wp.mat33, wp.mat33(0.0)),
         ]:
             builder.add_custom_attribute(
                 CA(
@@ -332,12 +356,18 @@ class SolverSPH(SolverBase):
         # must not use ``_fluid_count < n`` because the non-contiguous fallback
         # above forces ``_fluid_count = n`` even when dummies are present.
         self._has_dummies = bool(np.any(pt != 0))
+        self._use_kernel_correction = config.kernel_gradient_correction != "none"
         self._density_kernel = make_compute_density_kernel(self._has_dummies)
         self._smooth_density_kernel = make_smooth_density_kernel(self._has_dummies)
-        self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(self._has_dummies)
+        self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(
+            self._has_dummies, self._use_kernel_correction
+        )
         self._stress_force_kernel = make_compute_stress_force_kernel(self._has_dummies)
         self._artificial_viscosity_kernel = make_compute_artificial_viscosity_kernel(self._has_dummies)
         self._xsph_kernel = make_xsph_correction_kernel(self._has_dummies)
+        self._kernel_correction_kernel = (
+            make_compute_kernel_correction_kernel(self._has_dummies) if self._use_kernel_correction else None
+        )
 
         # Scratch for optional Marrone-style density smoothing pass.
         if config.density_smoothing_delta > 0.0:
@@ -447,6 +477,8 @@ class SolverSPH(SolverBase):
         self._compute_density(state_in)
         # 2b. Optional Marrone-style smoothing pass (no-op when delta == 0).
         self._smooth_density(state_in)
+        # 2c. Optional kernel-gradient correction matrix (no-op when correction == 'none').
+        self._compute_kernel_correction(state_in)
 
         # 3. Zero acceleration (cudaMemset is cheaper than a kernel launch)
         self._accel.zero_()
@@ -518,6 +550,8 @@ class SolverSPH(SolverBase):
         self._compute_density(state_out, pos=self._pos_mid, density_prev_source=state_in.sph.density)
         # 3b. Optional Marrone-style smoothing pass on midpoint density (no-op when delta == 0).
         self._smooth_density(state_out, pos=self._pos_mid, density_field=state_out.sph.density)
+        # 3c. Optional kernel-gradient correction at midpoint (no-op when correction == 'none').
+        self._compute_kernel_correction(state_out, pos=self._pos_mid, density_field=state_out.sph.density)
 
         # 4. Zero acceleration
         self._accel.zero_()
@@ -681,6 +715,44 @@ class SolverSPH(SolverBase):
         )
         wp.copy(rho, self._density_smooth)
 
+    def _compute_kernel_correction(
+        self,
+        state: newton.State,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+        density_field: wp.array[float] | None = None,
+    ) -> None:
+        """Compute per-particle kernel-gradient correction matrix.
+
+        No-op when ``Config.kernel_gradient_correction == 'none'``. Reads
+        positions from ``state.particle_q`` and density from ``state.sph.density``
+        unless overridden (e.g. midpoint configuration in Verlet).
+        Requires ``_build_neighbor_list`` to have been called first.
+        """
+        if not self._use_kernel_correction:
+            return
+
+        positions = pos if pos is not None else state.particle_q
+        rho = density_field if density_field is not None else state.sph.density
+        wp.launch(
+            self._kernel_correction_kernel,
+            dim=self._fluid_count,
+            inputs=[
+                self._hash_grid.id,
+                positions,
+                self.model.particle_mass,
+                rho,
+                self.model.particle_flags,
+                self._particle_type,
+                self._h,
+                self._support_radius,
+                self._config.reference_density,
+                self._config.kernel_correction_det_floor,
+            ],
+            outputs=[state.sph.kernel_grad_correction],
+            device=self.model.device,
+        )
+
     def _compute_velocity_gradient(
         self,
         state: newton.State,
@@ -688,7 +760,13 @@ class SolverSPH(SolverBase):
         pos: wp.array[wp.vec3] | None = None,
         vel: wp.array[wp.vec3] | None = None,
     ) -> None:
-        """Compute SPH velocity gradient tensor."""
+        """Compute SPH velocity gradient tensor.
+
+        Note: requires ``_build_neighbor_list(...)`` to have been called first.
+        When ``Config.kernel_gradient_correction != 'none'``, also requires
+        ``_compute_kernel_correction(...)`` to have populated
+        ``state.sph.kernel_grad_correction`` first.
+        """
         positions = pos if pos is not None else state.particle_q
         velocities = vel if vel is not None else state.particle_qd
         wp.launch(
@@ -703,6 +781,7 @@ class SolverSPH(SolverBase):
                 self.model.particle_flags,
                 self._particle_type,
                 self._wall_normal,
+                state.sph.kernel_grad_correction,
                 self._h,
                 self._support_radius,
                 self._config.dummy_beta,
