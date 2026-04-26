@@ -206,6 +206,68 @@ budget, MPM Q1 will hit a longer simulated time at the cost of
 - **B2 lockup needs upstream investigation** before drawing any
   conclusion about B2 vs Q1 trade-offs.
 
+## 7a. Phase C status — SPH accuracy gap closures
+
+The plan listed five sub-tasks to close known accuracy gaps in
+Newton's SPH solver so its theoretical edge over MPM holds in harder
+regimes. Status as of this revision:
+
+| ID | Feature | Status |
+|---|---|---|
+| C1 | δ-SPH-equivalent density smoothing (Marrone post-summation) | **Wired**, default OFF |
+| C2 | Kernel-gradient correction (CSPM / MLS) | **Deferred** (see below) |
+| C3 | Tensile-instability remedy (Monaghan 2000) | Not started |
+| C4 | Particle shifting (Lind 2012) | Not started |
+| C5 | RK2 integrator | Not started |
+
+### C1 — landed (commit `617fcfcf`)
+
+`SolverSPH.Config.density_smoothing_delta` ∈ [0, 1], default `0.0`.
+When non-zero, runs one extra Shepard-normalized smoothing pass over
+the density field after the usual summation, blending
+`ρ_out = (1-δ) ρ_in + δ · ρ̃`. Default OFF preserves the Phase B
+benchmark numbers bit-identically. Enabling it requires a separate
+benchmark re-run to characterise the runout shift.
+
+The architect chose this over canonical Antuono / Marrone δ-SPH
+because Newton recomputes density via fresh Shepard summation each
+substep (no continuity equation), so the canonical
+`dρ/dt + δ-term` form is structurally inapplicable.
+
+### C2 — deferred
+
+Phase C2 attempted to add Bonet-Lok 1999 / Bui 2008 first-order
+kernel-gradient correction (`L_i ∇W_ij` with `L_i` the inverse of the
+per-particle renormalisation matrix). Implementation reached a working
+state at the Python / harness level but encountered a Warp-runtime
+issue where the correction-aware velocity-gradient kernel produced an
+identically zero output in a unit test, despite:
+
+- Position and velocity fields verifiably set on `state.particle_q` /
+  `state.particle_qd` (numpy round-trip confirmed).
+- Density correctly populated (`mean = 1000.0`).
+- `kernel_grad_correction` array correctly populated (mostly identity
+  for small N=1000 boundary-dominated grids; expected fallback).
+- The same kernel works correctly inside the production
+  `solver.step(...)` pipeline (`test_sand_cube_position_verlet` and
+  `test_sand_cube_on_plane` both green).
+
+The discrepancy is between **direct invocation of the post-C2
+kernel** vs **invocation through `solver.step`**. Likely candidates:
+factory key tuple `(has_dummies, apply_correction)` interaction with
+`fem.cache.dynamic_kernel`, or a state initialisation step the unit
+test skips that the production pipeline performs.
+
+**Decision**: revert the C2 work-in-progress and split the diagnosis
+into a dedicated debugging session rather than burning more time on
+a Warp-runtime issue inside this Phase C cycle. Branch state on
+`rabm/sph-vs-mpm-accuracy` HEAD reflects only C1.
+
+C3 / C4 / C5 remain not started; they are independent of C2 and can
+be picked up in any order in a follow-up plan. C2 should be revisited
+first because C4 (particle shifting) typically wants the corrected
+gradient operator to compute the shifting velocity field.
+
 ## 8. Files
 
 - Harness: `analysis/sph_vs_mpm_column_collapse.py`

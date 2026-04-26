@@ -289,6 +289,8 @@ lod = "lod"
 Shepard = "Shepard"
 # Surname H. H. Bui — prolific SPH-in-geomechanics author (Bui et al. 2008, etc.)
 Bui = "Bui"
+# Surname A. R. J. Lok — second author of Bonet-Lok 1999 SPH gradient correction.
+Lok = "Lok"
 # MuJoCo Menagerie brand/product names
 Pincher = "Pincher"
 Robotis = "Robotis"
