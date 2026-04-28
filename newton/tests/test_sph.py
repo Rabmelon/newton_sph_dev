@@ -457,6 +457,359 @@ def test_specialization_cache_dedup(test, device):
     test.assertIs(solver_a._xsph_kernel, solver_b._xsph_kernel)
 
 
+def _make_volume_map_config(
+    smoothing_length: float,
+    *,
+    boundary_friction_viscosity: float = 0.0,
+    boundary_sticky: bool = False,
+) -> "SolverSPH.Config":
+    """Build a baseline SolverSPH.Config in volume_map mode for the new tests."""
+    config = SolverSPH.Config()
+    config.smoothing_length = smoothing_length
+    config.reference_density = 2500.0
+    config.boundary_type = "volume_map"
+    config.boundary_friction_viscosity = boundary_friction_viscosity
+    config.boundary_sticky = boundary_sticky
+    config.xsph_epsilon = 0.0
+    return config
+
+
+def test_volume_map_sand_cube_on_plane(test, device):
+    """Sand cube on a single ground plane with volume_map boundary should collapse and stay above the plane."""
+
+    N = 4
+    particles_per_cell = 3
+    smoothing_length = 0.15
+    particle_spacing = smoothing_length / particles_per_cell
+    dt = 0.001
+
+    builder = newton.ModelBuilder()
+    SolverSPH.register_custom_attributes(builder)
+
+    builder.add_particle_grid(
+        pos=wp.vec3(0.5 * particle_spacing),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=N * particles_per_cell,
+        dim_y=N * particles_per_cell,
+        dim_z=N * particles_per_cell,
+        cell_x=particle_spacing,
+        cell_y=particle_spacing,
+        cell_z=particle_spacing,
+        mass=0.1,
+        jitter=0.0,
+        custom_attributes={"sph:friction": 0.5},
+    )
+    builder.add_ground_plane()
+
+    model = builder.finalize(device=device)
+    config = _make_volume_map_config(smoothing_length, boundary_friction_viscosity=0.0)
+
+    state_0 = model.state()
+    state_1 = model.state()
+    solver = SolverSPH(model, config)
+
+    init_z_max = float(np.max(state_0.particle_q.numpy()[:, 2]))
+
+    for _ in range(100):
+        solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+        state_0, state_1 = state_1, state_0
+
+    final_pos = state_0.particle_q.numpy()
+    final_z_min = float(np.min(final_pos[:, 2]))
+    final_z_max = float(np.max(final_pos[:, 2]))
+
+    test.assertGreater(
+        final_z_min,
+        -smoothing_length,
+        f"Particles penetrated ground (volume_map): min z = {final_z_min:.4f}",
+    )
+    test.assertLess(
+        final_z_max,
+        init_z_max,
+        "Column did not collapse under gravity (volume_map)",
+    )
+
+
+def test_volume_map_six_plane_container(test, device):
+    """Fluid inside a six-plane box-shaped container should not escape under gravity."""
+
+    smoothing_length = 0.05
+    particle_spacing = smoothing_length / 2.0
+    dt = 0.0005
+
+    builder = newton.ModelBuilder()
+    SolverSPH.register_custom_attributes(builder)
+
+    half = 0.15  # container half-extent [m]
+    n_per_axis = 5
+    builder.add_particle_grid(
+        pos=wp.vec3(-0.5 * (n_per_axis - 1) * particle_spacing),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=n_per_axis,
+        dim_y=n_per_axis,
+        dim_z=n_per_axis,
+        cell_x=particle_spacing,
+        cell_y=particle_spacing,
+        cell_z=particle_spacing,
+        mass=2500.0 * particle_spacing**3,
+        jitter=0.0,
+        radius_mean=particle_spacing * 0.5,
+        custom_attributes={"sph:friction": 0.3},
+    )
+    # Six planes: outward normals point INTO the container so signed distance
+    # is positive inside (where fluid lives). For each face we add a plane
+    # whose outward normal is the negative of the face normal.
+    # Bottom face (normal +z, plane at z = -half).
+    builder.add_shape_plane(plane=(0.0, 0.0, 1.0, half), width=0.0, length=0.0)
+    # Top face (normal -z, plane at z = +half).
+    builder.add_shape_plane(plane=(0.0, 0.0, -1.0, half), width=0.0, length=0.0)
+    # Side faces (±x, ±y).
+    builder.add_shape_plane(plane=(1.0, 0.0, 0.0, half), width=0.0, length=0.0)
+    builder.add_shape_plane(plane=(-1.0, 0.0, 0.0, half), width=0.0, length=0.0)
+    builder.add_shape_plane(plane=(0.0, 1.0, 0.0, half), width=0.0, length=0.0)
+    builder.add_shape_plane(plane=(0.0, -1.0, 0.0, half), width=0.0, length=0.0)
+
+    model = builder.finalize(device=device)
+    config = _make_volume_map_config(smoothing_length, boundary_friction_viscosity=0.5)
+
+    state_0 = model.state()
+    state_1 = model.state()
+    solver = SolverSPH(model, config)
+    test.assertEqual(len(solver._volume_map_planes), 6)
+
+    leak_margin = smoothing_length
+    for _ in range(200):
+        solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+        state_0, state_1 = state_1, state_0
+
+    final_pos = state_0.particle_q.numpy()
+    for axis_name, axis in (("x", 0), ("y", 1), ("z", 2)):
+        ax_min = float(np.min(final_pos[:, axis]))
+        ax_max = float(np.max(final_pos[:, axis]))
+        test.assertGreater(
+            ax_min,
+            -half - leak_margin,
+            f"Fluid leaked through -{axis_name} face: min = {ax_min:.4f}",
+        )
+        test.assertLess(
+            ax_max,
+            half + leak_margin,
+            f"Fluid leaked through +{axis_name} face: max = {ax_max:.4f}",
+        )
+
+
+def test_volume_map_box_obstacle(test, device):
+    """A column of fluid dropped onto a box obstacle on the ground should not penetrate the box."""
+
+    smoothing_length = 0.05
+    particle_spacing = smoothing_length / 2.0
+    dt = 0.0005
+
+    builder = newton.ModelBuilder()
+    SolverSPH.register_custom_attributes(builder)
+
+    # Fluid column sits above a 0.2 m square box centered at origin (top at z = 0.05)
+    box_half = wp.vec3(0.10, 0.10, 0.05)
+    box_top = float(box_half[2])
+    n_per_axis = 4
+    builder.add_particle_grid(
+        pos=wp.vec3(
+            -0.5 * (n_per_axis - 1) * particle_spacing,
+            -0.5 * (n_per_axis - 1) * particle_spacing,
+            box_top + 4 * particle_spacing,
+        ),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=n_per_axis,
+        dim_y=n_per_axis,
+        dim_z=n_per_axis,
+        cell_x=particle_spacing,
+        cell_y=particle_spacing,
+        cell_z=particle_spacing,
+        mass=2500.0 * particle_spacing**3,
+        jitter=0.0,
+        radius_mean=particle_spacing * 0.5,
+        custom_attributes={"sph:friction": 0.3},
+    )
+    # Ground catch-plane far below in case fluid spills off the box; volume_map
+    # mode treats it as an additional plane.
+    builder.add_shape_plane(plane=(0.0, 0.0, 1.0, 0.5), width=0.0, length=0.0)
+    # The box obstacle (body=-1 → free-standing static shape).
+    builder.add_shape_box(
+        body=-1,
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+        hx=float(box_half[0]),
+        hy=float(box_half[1]),
+        hz=float(box_half[2]),
+    )
+
+    model = builder.finalize(device=device)
+    config = _make_volume_map_config(smoothing_length, boundary_friction_viscosity=0.2)
+
+    state_0 = model.state()
+    state_1 = model.state()
+    solver = SolverSPH(model, config)
+    test.assertEqual(len(solver._volume_map_boxes), 1)
+
+    for _ in range(200):
+        solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+        state_0, state_1 = state_1, state_0
+
+    final_pos = state_0.particle_q.numpy()
+    # No fluid particle should end up *inside* the box (with smoothing-length leeway).
+    inside_x = (final_pos[:, 0] > -float(box_half[0]) + smoothing_length) & (
+        final_pos[:, 0] < float(box_half[0]) - smoothing_length
+    )
+    inside_y = (final_pos[:, 1] > -float(box_half[1]) + smoothing_length) & (
+        final_pos[:, 1] < float(box_half[1]) - smoothing_length
+    )
+    inside_z = (final_pos[:, 2] > -float(box_half[2]) + smoothing_length) & (
+        final_pos[:, 2] < float(box_half[2]) - smoothing_length
+    )
+    inside_box = inside_x & inside_y & inside_z
+    n_penetrated = int(np.sum(inside_box))
+    test.assertEqual(
+        n_penetrated,
+        0,
+        f"{n_penetrated} fluid particle(s) penetrated the box obstacle",
+    )
+
+
+def test_volume_map_sphere_obstacle(test, device):
+    """Fluid dropped onto a sphere obstacle should not penetrate the sphere."""
+
+    smoothing_length = 0.05
+    particle_spacing = smoothing_length / 2.0
+    dt = 0.0005
+
+    builder = newton.ModelBuilder()
+    SolverSPH.register_custom_attributes(builder)
+
+    radius = 0.15
+    n_per_axis = 3
+    builder.add_particle_grid(
+        pos=wp.vec3(
+            -0.5 * (n_per_axis - 1) * particle_spacing,
+            -0.5 * (n_per_axis - 1) * particle_spacing,
+            radius + 3 * particle_spacing,
+        ),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=n_per_axis,
+        dim_y=n_per_axis,
+        dim_z=n_per_axis,
+        cell_x=particle_spacing,
+        cell_y=particle_spacing,
+        cell_z=particle_spacing,
+        mass=2500.0 * particle_spacing**3,
+        jitter=0.0,
+        radius_mean=particle_spacing * 0.5,
+        custom_attributes={"sph:friction": 0.3},
+    )
+    # Catch ground plane.
+    builder.add_shape_plane(plane=(0.0, 0.0, 1.0, 0.5), width=0.0, length=0.0)
+    # Sphere obstacle (body=-1 → free-standing static shape).
+    builder.add_shape_sphere(
+        body=-1,
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+        radius=radius,
+    )
+
+    model = builder.finalize(device=device)
+    config = _make_volume_map_config(smoothing_length, boundary_friction_viscosity=0.2)
+
+    state_0 = model.state()
+    state_1 = model.state()
+    solver = SolverSPH(model, config)
+    test.assertEqual(len(solver._volume_map_spheres), 1)
+
+    for _ in range(150):
+        solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+        state_0, state_1 = state_1, state_0
+
+    final_pos = state_0.particle_q.numpy()
+    distances = np.linalg.norm(final_pos, axis=-1)
+    n_penetrated = int(np.sum(distances < radius - smoothing_length))
+    test.assertEqual(
+        n_penetrated,
+        0,
+        f"{n_penetrated} fluid particle(s) penetrated the sphere obstacle "
+        f"(min distance from origin: {distances.min():.4f}, expected ≥ {radius - smoothing_length:.4f})",
+    )
+
+
+def test_volume_map_implicit_friction_damps_velocity(test, device):
+    """Higher boundary friction viscosity should leave fluid with smaller mean speed."""
+
+    smoothing_length = 0.10
+    particle_spacing = smoothing_length / 2.0
+    dt = 0.001
+
+    def _run(mu_b: float, sticky: bool = False) -> float:
+        builder = newton.ModelBuilder()
+        SolverSPH.register_custom_attributes(builder)
+
+        # Thin layer of fluid sitting on the plane with a small initial sliding
+        # velocity along +x. With volume-map friction, larger μ_B should damp
+        # the velocity more by the end of the run.
+        n_per_axis = 4
+        builder.add_particle_grid(
+            pos=wp.vec3(
+                -0.5 * (n_per_axis - 1) * particle_spacing,
+                -0.5 * (n_per_axis - 1) * particle_spacing,
+                smoothing_length * 0.6,
+            ),
+            rot=wp.quat_identity(),
+            vel=wp.vec3(0.5, 0.0, 0.0),
+            dim_x=n_per_axis,
+            dim_y=n_per_axis,
+            dim_z=2,
+            cell_x=particle_spacing,
+            cell_y=particle_spacing,
+            cell_z=particle_spacing,
+            mass=2500.0 * particle_spacing**3,
+            jitter=0.0,
+            radius_mean=particle_spacing * 0.5,
+            custom_attributes={"sph:friction": 0.3},
+        )
+        builder.add_ground_plane()
+
+        model = builder.finalize(device=device)
+        config = _make_volume_map_config(
+            smoothing_length,
+            boundary_friction_viscosity=mu_b,
+            boundary_sticky=sticky,
+        )
+
+        state_0 = model.state()
+        state_1 = model.state()
+        solver = SolverSPH(model, config)
+        for _ in range(120):
+            solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+            state_0, state_1 = state_1, state_0
+
+        v = state_0.particle_qd.numpy()
+        # Mean tangential speed magnitude (x-y component).
+        return float(np.mean(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2)))
+
+    v_low = _run(0.0)
+    v_high = _run(5.0)
+    test.assertLess(
+        v_high,
+        v_low,
+        f"Higher boundary friction did not damp velocity: v(μ_B=5.0)={v_high:.3f} vs v(μ_B=0)={v_low:.3f}",
+    )
+
+    v_sticky = _run(50.0, sticky=True)
+    test.assertLess(
+        v_sticky,
+        v_high,
+        f"Sticky variant should damp at least as much as sliding: v_sticky={v_sticky:.3f} vs v(μ_B=5.0)={v_high:.3f}",
+    )
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -490,6 +843,41 @@ add_function_test(
     TestSPH,
     "test_specialization_cache_dedup",
     test_specialization_cache_dedup,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_volume_map_sand_cube_on_plane",
+    test_volume_map_sand_cube_on_plane,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_volume_map_six_plane_container",
+    test_volume_map_six_plane_container,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_volume_map_box_obstacle",
+    test_volume_map_box_obstacle,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_volume_map_sphere_obstacle",
+    test_volume_map_sphere_obstacle,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_volume_map_implicit_friction_damps_velocity",
+    test_volume_map_implicit_friction_damps_velocity,
     devices=devices,
     check_output=False,
 )

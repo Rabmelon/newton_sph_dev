@@ -40,6 +40,10 @@ from .sph_constitutive import (
     update_stress_mui_kernel,
 )
 from .sph_dummy_boundary import add_dummy_particles_to_builder
+from .sph_implicit_viscosity import (
+    ImplicitFrictionSolver,
+    apply_identity_kernel,
+)
 from .sph_kernels import (
     compute_strain_rate_kernel,
     half_step_position_kernel,
@@ -52,6 +56,15 @@ from .sph_kernels import (
     make_xsph_correction_kernel,
 )
 from .sph_model import SPHModel
+from .sph_volume_map import compute_volume_map_table
+from .sph_volume_map_kernels import (
+    friction_laplacian_box_kernel,
+    friction_laplacian_plane_kernel,
+    friction_laplacian_sphere_kernel,
+    volume_map_pressure_box_kernel,
+    volume_map_pressure_plane_kernel,
+    volume_map_pressure_sphere_kernel,
+)
 
 
 class SolverSPH(SolverBase):
@@ -102,7 +115,9 @@ class SolverSPH(SolverBase):
 
         # --- Boundary ---
         boundary_type: str = "penalty"
-        """Boundary treatment: ``'penalty'`` (default) or ``'dummy'`` (layered dummy particles)."""
+        """Boundary treatment: ``'penalty'`` (default), ``'dummy'`` (layered dummy
+        particles), or ``'volume_map'`` (Bender 2020 volume-map pressure with implicit
+        viscous friction; supports plane / box / sphere shapes)."""
         penalty_stiffness: float = 1.0e6
         """SDF penalty boundary stiffness [N/m]."""
         penalty_damping: float = 1.0e3
@@ -111,6 +126,24 @@ class SolverSPH(SolverBase):
         """Coulomb friction coefficient mu for penalty boundary surfaces."""
         dummy_beta: float = 1.7
         """Distance-based dummy boundary extrapolation factor."""
+        boundary_friction_viscosity: float = 0.1
+        """Boundary surface viscosity μ_B [kg/(m·s)] used by ``volume_map`` boundary
+        type. This is a *linear viscous* drag (Bender 2020 Eq. 19), not a Coulomb
+        friction coefficient — it has dimensions of dynamic viscosity and does not
+        depend on normal pressure. Set to 0 to disable boundary friction while still
+        applying volume-map boundary pressure."""
+        boundary_sticky: bool = False
+        """Whether the volume-map boundary uses the sticky variant. ``False`` (default)
+        applies tangent-projected friction (Eq. 18) — fluid slides along the boundary;
+        ``True`` skips the projection so normal motion is also damped (honey-on-grid
+        regime)."""
+        viscosity_solver_max_iter: int = 100
+        """Maximum CG iterations for the implicit boundary-friction solver."""
+        viscosity_solver_tol: float = 1.0e-3
+        """Relative residual tolerance for the implicit boundary-friction solver
+        (``||r||/||b|| < tol``)."""
+        volume_map_table_size: int = 256
+        """Number of samples in the precomputed V_B(d) volume-map table."""
 
         # --- Corrections ---
         xsph_epsilon: float = 0.0
@@ -129,7 +162,7 @@ class SolverSPH(SolverBase):
                     f"Invalid integration_scheme: {self.integration_scheme}. "
                     f"Must be one of {supported_integration_schemes}."
                 )
-            supported_boundary_types = {"penalty", "dummy"}
+            supported_boundary_types = {"penalty", "dummy", "volume_map"}
             if self.boundary_type not in supported_boundary_types:
                 raise ValueError(
                     f"Invalid boundary_type: {self.boundary_type}. Must be one of {supported_boundary_types}."
@@ -289,6 +322,35 @@ class SolverSPH(SolverBase):
         if config.boundary_type == "penalty":
             self._ground_planes = self._extract_ground_planes()
 
+        # Cache shape data for the volume-map boundary; build the
+        # precomputed V_B(d) table and the implicit-friction CG solver.
+        # All caches live on the solver so the per-step path runs without
+        # GPU→CPU sync.
+        self._volume_map_planes: list[tuple[wp.vec3, float]] = []
+        self._volume_map_boxes: list[tuple[wp.transform, wp.vec3]] = []
+        self._volume_map_spheres: list[tuple[wp.transform, float]] = []
+        self._volume_map_table: wp.array | None = None
+        self._friction_solver: ImplicitFrictionSolver | None = None
+        if config.boundary_type == "volume_map":
+            self._volume_map_planes = self._extract_ground_planes()
+            self._volume_map_boxes = self._extract_box_shapes()
+            self._volume_map_spheres = self._extract_sphere_shapes()
+            with wp.ScopedDevice(model.device):
+                self._volume_map_table = compute_volume_map_table(
+                    self._support_radius,
+                    n_samples=config.volume_map_table_size,
+                    device=model.device,
+                )
+            self._friction_solver = ImplicitFrictionSolver(
+                n=n,
+                device=model.device,
+                max_iter=config.viscosity_solver_max_iter,
+                tol=config.viscosity_solver_tol,
+            )
+            # Tentative-velocity buffer (the right-hand side ``b`` of the CG
+            # solve and warm-start initial guess).
+            self._friction_b = wp.zeros(n, dtype=wp.vec3, device=model.device)
+
         # Compute fluid particle count for optimized kernel launches.
         # Fluid particles must be contiguous at the front of the array
         # (guaranteed when add_dummy_particles is called after fluid emission).
@@ -342,6 +404,59 @@ class SolverSPH(SolverBase):
                 planes.append((normal, float(offset)))
         return planes
 
+    def _extract_box_shapes(self) -> list[tuple[wp.transform, wp.vec3]]:
+        """Pre-compute per-box pose and half-extents from model shapes.
+
+        Used by the volume-map boundary path. Each entry is
+        ``(shape_transform, half_extents)`` where ``shape_transform`` is the
+        7-float ``wp.transform`` (3 position + 4 quaternion) and
+        ``half_extents = (hx, hy, hz)`` from ``Model.shape_scale``.
+        """
+        model = self.model
+        if model.shape_count == 0:
+            return []
+        geo_types = model.shape_type.numpy()
+        shape_transforms = model.shape_transform.numpy()
+        shape_scales = model.shape_scale.numpy()
+        boxes: list[tuple[wp.transform, wp.vec3]] = []
+        for s in range(model.shape_count):
+            if geo_types[s] != int(GeoType.BOX):
+                continue
+            tf = shape_transforms[s]
+            sc = shape_scales[s]
+            px, py, pz = float(tf[0]), float(tf[1]), float(tf[2])
+            qx, qy, qz, qw = float(tf[3]), float(tf[4]), float(tf[5]), float(tf[6])
+            transform = wp.transform(wp.vec3(px, py, pz), wp.quat(qx, qy, qz, qw))
+            half_extents = wp.vec3(float(sc[0]), float(sc[1]), float(sc[2]))
+            boxes.append((transform, half_extents))
+        return boxes
+
+    def _extract_sphere_shapes(self) -> list[tuple[wp.transform, float]]:
+        """Pre-compute per-sphere pose and radius from model shapes.
+
+        Used by the volume-map boundary path. Each entry is
+        ``(shape_transform, radius)``. ``Model.shape_scale`` for sphere
+        shapes stores ``(radius, radius, radius)`` (see ``Builder``); we
+        read the first component.
+        """
+        model = self.model
+        if model.shape_count == 0:
+            return []
+        geo_types = model.shape_type.numpy()
+        shape_transforms = model.shape_transform.numpy()
+        shape_scales = model.shape_scale.numpy()
+        spheres: list[tuple[wp.transform, float]] = []
+        for s in range(model.shape_count):
+            if geo_types[s] != int(GeoType.SPHERE):
+                continue
+            tf = shape_transforms[s]
+            sc = shape_scales[s]
+            px, py, pz = float(tf[0]), float(tf[1]), float(tf[2])
+            qx, qy, qz, qw = float(tf[3]), float(tf[4]), float(tf[5]), float(tf[6])
+            transform = wp.transform(wp.vec3(px, py, pz), wp.quat(qx, qy, qz, qw))
+            spheres.append((transform, float(sc[0])))
+        return spheres
+
     @property
     def config(self) -> Config:
         """Current solver configuration."""
@@ -361,6 +476,10 @@ class SolverSPH(SolverBase):
         if flags & SolverNotifyFlags.SHAPE_PROPERTIES:
             if self._config.boundary_type == "penalty":
                 self._ground_planes = self._extract_ground_planes()
+            elif self._config.boundary_type == "volume_map":
+                self._volume_map_planes = self._extract_ground_planes()
+                self._volume_map_boxes = self._extract_box_shapes()
+                self._volume_map_spheres = self._extract_sphere_shapes()
 
     # ------------------------------------------------------------------
     # Main simulation step
@@ -439,12 +558,25 @@ class SolverSPH(SolverBase):
             self._compute_artificial_viscosity(state_in)
 
         # 8. Boundary forces (penalty method only; dummy particles
-        #    handle boundaries through the SPH kernels themselves)
+        #    handle boundaries through the SPH kernels themselves;
+        #    volume_map handles pressure here and friction post-integration)
         if self._config.boundary_type == "penalty":
             self._apply_boundary_forces(state_in)
+        elif self._config.boundary_type == "volume_map":
+            self._apply_volume_map_pressure(
+                pos=state_in.particle_q,
+                pressure=state_out.sph.pressure,
+                density=state_in.sph.density,
+            )
 
         # 9. Time integration (symplectic Euler, includes gravity)
         self._integrate(state_in, state_out, dt)
+
+        # 9.5. Implicit boundary-friction velocity correction (volume_map only).
+        # Operates in-place on state_out.particle_qd: the explicit
+        # tentative velocity becomes the right-hand side of the CG solve.
+        if self._config.boundary_type == "volume_map" and self._config.boundary_friction_viscosity > 0.0:
+            self._solve_implicit_friction(state_out, dt)
 
         # 10. XSPH velocity correction
         if self._config.xsph_epsilon > 0.0:
@@ -522,9 +654,19 @@ class SolverSPH(SolverBase):
         # 8. Boundary forces at midpoint
         if self._config.boundary_type == "penalty":
             self._apply_boundary_forces(state_in, pos=self._pos_mid, vel=state_in.particle_qd)
+        elif self._config.boundary_type == "volume_map":
+            self._apply_volume_map_pressure(
+                pos=self._pos_mid,
+                pressure=state_out.sph.pressure,
+                density=state_out.sph.density,
+            )
 
         # 9. Full-step velocity + final position
         self._integrate_verlet_final(state_in, state_out, dt)
+
+        # 9.5. Implicit boundary-friction velocity correction (volume_map only).
+        if self._config.boundary_type == "volume_map" and self._config.boundary_friction_viscosity > 0.0:
+            self._solve_implicit_friction(state_out, dt)
 
         # 10. XSPH velocity correction (uses midpoint hash grid)
         if self._config.xsph_epsilon > 0.0:
@@ -826,6 +968,208 @@ class SolverSPH(SolverBase):
                 outputs=[self._accel],
                 device=self.model.device,
             )
+
+    def _apply_volume_map_pressure(
+        self,
+        pos: wp.array[wp.vec3],
+        pressure: wp.array[float],
+        density: wp.array[float],
+    ) -> None:
+        """Accumulate Bender 2020 volume-map boundary pressure into ``self._accel``.
+
+        Iterates the cached plane / box / sphere shape lists built by
+        ``_extract_*_shapes`` and launches one boundary-pressure kernel
+        per shape. Each kernel reads particle pressure / density and the
+        precomputed V_B(d) table to evaluate Eq. 15 with mirroring
+        ``p~ = max(p_i, 0)`` and ``rho~ = rho₀``.
+
+        Args:
+            pos: World-frame particle positions [m].
+            pressure: Particle pressure ``-tr(sigma)/3`` [Pa].
+            density: Particle density [kg/m³].
+        """
+        model = self.model
+        n = model.particle_count
+        h = self._h
+        r = self._support_radius
+        rho0 = self._config.reference_density
+        table = self._volume_map_table
+
+        for normal, offset in self._volume_map_planes:
+            wp.launch(
+                volume_map_pressure_plane_kernel,
+                dim=n,
+                inputs=[
+                    pos,
+                    pressure,
+                    density,
+                    model.particle_flags,
+                    self._particle_type,
+                    normal,
+                    offset,
+                    h,
+                    r,
+                    rho0,
+                    table,
+                ],
+                outputs=[self._accel],
+                device=model.device,
+            )
+        for transform, half_extents in self._volume_map_boxes:
+            wp.launch(
+                volume_map_pressure_box_kernel,
+                dim=n,
+                inputs=[
+                    pos,
+                    pressure,
+                    density,
+                    model.particle_flags,
+                    self._particle_type,
+                    transform,
+                    half_extents,
+                    h,
+                    r,
+                    rho0,
+                    table,
+                ],
+                outputs=[self._accel],
+                device=model.device,
+            )
+        for transform, radius in self._volume_map_spheres:
+            wp.launch(
+                volume_map_pressure_sphere_kernel,
+                dim=n,
+                inputs=[
+                    pos,
+                    pressure,
+                    density,
+                    model.particle_flags,
+                    self._particle_type,
+                    transform,
+                    radius,
+                    h,
+                    r,
+                    rho0,
+                    table,
+                ],
+                outputs=[self._accel],
+                device=model.device,
+            )
+
+    def _solve_implicit_friction(self, state: newton.State, dt: float) -> None:
+        """Solve ``A v = v*`` with friction-only A; in-place on ``state.particle_qd``.
+
+        ``v*`` (the explicit-integration tentative velocity) is read from
+        ``state.particle_qd`` at entry, copied into the right-hand-side
+        buffer, and then ``state.particle_qd`` is overwritten with the
+        CG solution. The apply-operator launches the identity kernel to
+        seed ``y = x`` and then accumulates ``y += -dt μ_B/rho_i · L_B[x]_i``
+        from each cached boundary shape.
+
+        Position is NOT re-integrated after the friction step; the
+        position update from ``_integrate`` / ``_integrate_verlet_final``
+        used the pre-friction velocity, so a second-order O(dt²)
+        position residual remains. Acceptable under acoustic-CFL ``dt``.
+
+        Args:
+            state: State whose ``particle_qd`` will be updated in place.
+            dt: Time step [s].
+        """
+        model = self.model
+        n = model.particle_count
+        device = model.device
+        flags = model.particle_flags
+        ptype = self._particle_type
+        h = self._h
+        r = self._support_radius
+        density = state.sph.density
+        pos = state.particle_q
+        mu_b = self._config.boundary_friction_viscosity
+        sticky = 1 if self._config.boundary_sticky else 0
+        table = self._volume_map_table
+        solver = self._friction_solver
+        b = self._friction_b
+
+        # b = state.particle_qd (the explicit tentative velocity v*).
+        wp.copy(b, state.particle_qd)
+
+        def apply_op(x_in: wp.array, y_out: wp.array) -> None:
+            wp.launch(
+                apply_identity_kernel,
+                dim=n,
+                inputs=[x_in, flags, ptype],
+                outputs=[y_out],
+                device=device,
+            )
+            for normal, offset in self._volume_map_planes:
+                wp.launch(
+                    friction_laplacian_plane_kernel,
+                    dim=n,
+                    inputs=[
+                        pos,
+                        x_in,
+                        density,
+                        flags,
+                        ptype,
+                        normal,
+                        offset,
+                        h,
+                        r,
+                        dt,
+                        mu_b,
+                        sticky,
+                        table,
+                    ],
+                    outputs=[y_out],
+                    device=device,
+                )
+            for transform, half_extents in self._volume_map_boxes:
+                wp.launch(
+                    friction_laplacian_box_kernel,
+                    dim=n,
+                    inputs=[
+                        pos,
+                        x_in,
+                        density,
+                        flags,
+                        ptype,
+                        transform,
+                        half_extents,
+                        h,
+                        r,
+                        dt,
+                        mu_b,
+                        sticky,
+                        table,
+                    ],
+                    outputs=[y_out],
+                    device=device,
+                )
+            for transform, radius in self._volume_map_spheres:
+                wp.launch(
+                    friction_laplacian_sphere_kernel,
+                    dim=n,
+                    inputs=[
+                        pos,
+                        x_in,
+                        density,
+                        flags,
+                        ptype,
+                        transform,
+                        radius,
+                        h,
+                        r,
+                        dt,
+                        mu_b,
+                        sticky,
+                        table,
+                    ],
+                    outputs=[y_out],
+                    device=device,
+                )
+
+        # Warm start with v*; CG converges in 0 iterations for interior particles.
+        solver.solve(state.particle_qd, b, flags, ptype, apply_op)
 
     def _integrate(self, state_in: newton.State, state_out: newton.State, dt: float) -> None:
         """Symplectic Euler time integration."""
