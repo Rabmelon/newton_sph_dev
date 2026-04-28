@@ -83,6 +83,16 @@ examples = [
     "Pillow>=9.0.0",        # for image processing (viewer icons, heightfield loading, textures)
 ]
 
+# Minimal extra for SPH solver development.
+# SPH only depends on warp-lang (base) + numpy (transitive); these add the OpenGL
+# viewer used by SPH examples. Excludes mujoco-warp, mesh importers, USD, rerun,
+# torch — all unused by the SPH solver, tests, and built-in examples.
+sph = [
+    "pyglet>=2.1.6,<3",     # OpenGL viewer for interactive SPH runs
+    "imgui_bundle>=1.92.0", # viewer GUI overlay (graceful fallback if missing)
+    "Pillow>=9.0.0",        # window icons + viewer texture assets
+]
+
 # Extra dependency needed to run examples that inference an RL policy
 torch-cu12 = [
     "newton[examples]", # include example dependencies
