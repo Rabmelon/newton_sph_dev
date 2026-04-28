@@ -610,8 +610,12 @@ def test_volume_map_box_obstacle(test, device):
     builder = newton.ModelBuilder()
     SolverSPH.register_custom_attributes(builder)
 
-    # Fluid column sits above a 0.2 m square box centered at origin (top at z = 0.05)
-    box_half = wp.vec3(0.10, 0.10, 0.05)
+    # Fluid column sits above a 0.2 m square box centered at origin
+    # (top at z = box_half[2]). Each half-extent must exceed
+    # ``smoothing_length`` so the inside-margin window
+    # ``(-h_extent + sl, +h_extent - sl)`` used in the no-penetration check
+    # is non-degenerate.
+    box_half = wp.vec3(0.15, 0.15, 0.12)
     box_top = float(box_half[2])
     n_per_axis = 4
     builder.add_particle_grid(
@@ -658,6 +662,16 @@ def test_volume_map_box_obstacle(test, device):
         state_0, state_1 = state_1, state_0
 
     final_pos = state_0.particle_q.numpy()
+    # Verify each half-extent leaves a non-degenerate margin window before
+    # using it as a no-penetration check, so a future scaling tweak does
+    # not silently turn this into a vacuous assertion.
+    for k, name in ((0, "x"), (1, "y"), (2, "z")):
+        test.assertGreater(
+            float(box_half[k]),
+            smoothing_length,
+            f"box_half[{name}] must exceed smoothing_length for the inside-margin "
+            f"check to be meaningful (got {float(box_half[k]):.4f} ≤ {smoothing_length:.4f})",
+        )
     # No fluid particle should end up *inside* the box (with smoothing-length leeway).
     inside_x = (final_pos[:, 0] > -float(box_half[0]) + smoothing_length) & (
         final_pos[:, 0] < float(box_half[0]) - smoothing_length
@@ -746,13 +760,14 @@ def test_volume_map_implicit_friction_damps_velocity(test, device):
     smoothing_length = 0.10
     particle_spacing = smoothing_length / 2.0
     dt = 0.001
+    cg_iter_budget = 50
 
-    def _run(mu_b: float, sticky: bool = False) -> float:
+    def _run(mu_b: float, sticky: bool = False) -> tuple[float, int]:
         builder = newton.ModelBuilder()
         SolverSPH.register_custom_attributes(builder)
 
         # Thin layer of fluid sitting on the plane with a small initial sliding
-        # velocity along +x. With volume-map friction, larger μ_B should damp
+        # velocity along +x. With volume-map friction, larger mu_B should damp
         # the velocity more by the end of the run.
         n_per_axis = 4
         builder.add_particle_grid(
@@ -786,27 +801,109 @@ def test_volume_map_implicit_friction_damps_velocity(test, device):
         state_0 = model.state()
         state_1 = model.state()
         solver = SolverSPH(model, config)
+        max_iter_seen = 0
         for _ in range(120):
             solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
             state_0, state_1 = state_1, state_0
+            if mu_b > 0.0 and solver._friction_solver is not None:
+                max_iter_seen = max(max_iter_seen, solver._friction_solver.last_iter_count)
 
         v = state_0.particle_qd.numpy()
         # Mean tangential speed magnitude (x-y component).
-        return float(np.mean(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2)))
+        v_t = float(np.mean(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2)))
+        return v_t, max_iter_seen
 
-    v_low = _run(0.0)
-    v_high = _run(5.0)
+    v_low, _ = _run(0.0)
+    v_high, iter_high = _run(5.0)
     test.assertLess(
         v_high,
         v_low,
-        f"Higher boundary friction did not damp velocity: v(μ_B=5.0)={v_high:.3f} vs v(μ_B=0)={v_low:.3f}",
+        f"Higher boundary friction did not damp velocity: v(mu_B=5.0)={v_high:.3f} vs v(mu_B=0)={v_low:.3f}",
+    )
+    # CG should converge well within the budget for this small scenario; if it
+    # ever needs more, the operator conditioning has regressed (e.g. via a
+    # change to the friction Laplacian) and warrants investigation.
+    test.assertLess(
+        iter_high,
+        cg_iter_budget,
+        f"CG iteration count {iter_high} exceeded budget {cg_iter_budget} during sliding run",
     )
 
-    v_sticky = _run(50.0, sticky=True)
+    v_sticky, iter_sticky = _run(50.0, sticky=True)
     test.assertLess(
         v_sticky,
         v_high,
-        f"Sticky variant should damp at least as much as sliding: v_sticky={v_sticky:.3f} vs v(μ_B=5.0)={v_high:.3f}",
+        f"Sticky variant should damp at least as much as sliding: v_sticky={v_sticky:.3f} vs v(mu_B=5.0)={v_high:.3f}",
+    )
+    test.assertLess(
+        iter_sticky,
+        cg_iter_budget,
+        f"CG iteration count {iter_sticky} exceeded budget {cg_iter_budget} during sticky run",
+    )
+
+
+def test_volume_map_table_sanity_bounds(test, device):
+    """The precomputed V_B(d) volume-map table should match analytical limits.
+
+    Reads the cached ``solver._volume_map_table`` after constructing a
+    volume-map solver — exercises the CPU-side ``compute_volume_map_table``
+    quadrature without widening the public-API import surface.
+    """
+    smoothing_length = 0.05
+    builder = newton.ModelBuilder()
+    SolverSPH.register_custom_attributes(builder)
+    builder.add_particle_grid(
+        pos=wp.vec3(0.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=2,
+        dim_y=2,
+        dim_z=2,
+        cell_x=smoothing_length,
+        cell_y=smoothing_length,
+        cell_z=smoothing_length,
+        mass=2500.0 * smoothing_length**3,
+        jitter=0.0,
+        radius_mean=smoothing_length * 0.5,
+    )
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+
+    config = _make_volume_map_config(smoothing_length)
+    config.volume_map_table_size = 256
+    solver = SolverSPH(model, config)
+
+    table = solver._volume_map_table.numpy()
+    r = solver._support_radius
+    full = (4.0 / 3.0) * np.pi * r**3
+    half = 0.5 * full
+
+    # V_B(d/r = -1) ≈ full kernel-support volume (whole sphere inside solid).
+    test.assertAlmostEqual(
+        float(table[0]) / full,
+        1.0,
+        delta=0.01,
+        msg=f"V_B(-r) = {table[0]:.4e}, expected ~ full kernel volume {full:.4e}",
+    )
+    # V_B(d/r = 0) lies between half-volume and full-volume — the inside half
+    # of the support contributes its full sphere segment, plus the smoothed
+    # gamma* tail through the outside half adds a fraction more.
+    mid_idx = (len(table) - 1) // 2
+    v_mid = float(table[mid_idx])
+    test.assertGreater(
+        v_mid,
+        half * 0.95,
+        f"V_B(0) = {v_mid:.4e} unexpectedly below half-volume {half:.4e}",
+    )
+    test.assertLess(
+        v_mid,
+        full,
+        f"V_B(0) = {v_mid:.4e} should be strictly less than full volume {full:.4e}",
+    )
+    # The table must decrease monotonically in d.
+    test.assertTrue(
+        np.all(np.diff(table) <= 1.0e-6),
+        f"V_B(d) is not monotonically non-increasing in d; max increase observed: {float(np.max(np.diff(table))):.4e}",
     )
 
 
@@ -878,6 +975,13 @@ add_function_test(
     TestSPH,
     "test_volume_map_implicit_friction_damps_velocity",
     test_volume_map_implicit_friction_damps_velocity,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSPH,
+    "test_volume_map_table_sanity_bounds",
+    test_volume_map_table_sanity_bounds,
     devices=devices,
     check_output=False,
 )

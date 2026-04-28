@@ -101,12 +101,16 @@ def _eval_volume_map_pressure_accel(
 
     v_b = sample_volume_map(d, support_radius, volume_map_table)
 
-    # Mirror pressure with non-negative clamp; avoid tension pulling
-    # fluid through the wall.
-    p_b = wp.max(p_i, 0.0)
+    # Clamp BOTH the particle-side pressure (used directly in the symmetric
+    # form) and the boundary mirror to a non-negative value. Either alone
+    # leaves a leak: a negative p_i (DP tension transient before return
+    # mapping) flips the coefficient sign and yields an inward force; a
+    # negative p_b would do the same via the mirror term. Clamping both
+    # terms keeps the boundary force monotonically outward.
+    p_clamped = wp.max(p_i, 0.0)
     rho_b = reference_density
 
-    coeff = v_b * reference_density * (p_i / (rho_i * rho_i) + p_b / (rho_b * rho_b))
+    coeff = v_b * reference_density * (p_clamped / (rho_i * rho_i) + p_clamped / (rho_b * rho_b))
     return -coeff * grad_w
 
 
