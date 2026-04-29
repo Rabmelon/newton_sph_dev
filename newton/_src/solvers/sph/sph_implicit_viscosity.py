@@ -219,13 +219,21 @@ class ImplicitFrictionSolver:
         particle_type: wp.array,
         apply_op,
     ) -> int:
-        """Solve ``A x = b`` in-place starting from the warm-start ``x = b``.
+        """Solve ``A x = b`` in-place; initial guess is zeroed.
+
+        The initial guess is forced to zero rather than warm-started from
+        ``b`` (the tentative-velocity ``v*``). With a warm-start at ``x = b``,
+        a correction smaller than ``tol * ||b||`` would leave ``x`` equal to
+        ``v*`` — i.e. the friction correction would be silently discarded
+        whenever the per-step relative residual falls below ``tol``. Forcing
+        ``x_0 = 0`` makes ``r_0 = b`` and CG always iterates at least once;
+        for the trivial interior case ``A = I`` the exact solution
+        ``x = b`` is reached in a single iteration.
 
         Args:
-            x: Input/output velocity array (``wp.array[wp.vec3]``,
-                length ``n``). Initial guess on entry, solution on exit.
-                Caller typically passes the tentative-velocity array
-                ``v*`` as both initial guess and right-hand side ``b``.
+            x: Output velocity array (``wp.array[wp.vec3]``, length ``n``).
+                Caller passes ``state.particle_qd``; on exit it holds the
+                CG solution. Whatever ``x`` contains on entry is overwritten.
             b: Right-hand side ``v*`` (``wp.array[wp.vec3]``).
             particle_flags: Particle activity flags.
             particle_type: Particle type array.
@@ -241,19 +249,13 @@ class ImplicitFrictionSolver:
         n = self.n
         device = self.device
 
-        # r_0 = b - A x_0
-        apply_op(x, self._tmp)
+        # x_0 = 0 (zero initial guess, see docstring rationale).
+        x.zero_()
+        # With x_0 = 0, A x_0 = 0 and so r_0 = b - A x_0 = b directly.
         wp.launch(
             vec3_copy_kernel,
             dim=n,
             inputs=[b, particle_flags, particle_type],
-            outputs=[self._r],
-            device=device,
-        )
-        wp.launch(
-            vec3_axpy_kernel,
-            dim=n,
-            inputs=[-1.0, self._tmp, particle_flags, particle_type],
             outputs=[self._r],
             device=device,
         )
