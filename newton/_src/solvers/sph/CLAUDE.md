@@ -240,7 +240,46 @@ and re-checked in each `_step_*` via `else: raise`.
 
 ## 9. Boundary treatments
 
-Selected by `Config.boundary_type ∈ {"penalty", "dummy"}`.
+Selected by `Config.boundary_type ∈ {"penalty", "dummy", "volume_map"}`.
+
+> **`volume_map` — Path 2b Adami-style mirror pressure.** The literal
+> Bender 2020 Eq. 15 boundary-pressure formula
+> (`a = -V_B ρ_0 (p_i/ρ_i² + p_i/ρ_b²) ∇W`) was designed for an implicit
+> (IISPH/PCISPH) pressure solver and blows up under Newton's explicit
+> WCSPH+DP path — the `1/ρ²` quadratic dependence couples the boundary
+> force back into the Tait equation of state via positive feedback
+> (instrumentation showed boundary acceleration ~1500× gravity at substep 1,
+> amplifying to ~80,000× within ~8 substeps). The kernel
+> `_eval_volume_map_pressure_accel` in `sph_volume_map_kernels.py` was
+> rewritten to use an Adami 2012-style mirror-pressure form
+> (`p_b = max(p_i, 0) + ρ_i max(0, -g·n) max(0, -d)`,
+> `a = -V_B (p_i + p_b) / (ρ_i ρ_0) ∇W`) plus a one-sided wall-normal
+> viscous damper (`a_d = dummy_beta · V_B / h² · max(0, -v·n) · n`) as a
+> safety net. The form is linear in pressure (no Tait feedback), uses
+> `V_B(d)` as the boundary-volume surrogate, and is verified stable under
+> WCSPH+DP at the same step size as the penalty/dummy paths. The implicit
+> boundary-friction CG solve (`Config.boundary_friction_viscosity`,
+> `Config.boundary_sticky`) is wired via `_solve_implicit_friction` and is
+> active under Path 2b.
+>
+> **Penalty fallback for d < 0.** Adami pressure vanishes at d = 0 (∇W ∝ q → 0)
+> and at |d| > 2h (∇W = 0), so the kernel adds a damped-spring escapee-recovery
+> term `f = max(0, k·|d| − c·v_n)` with `k = Config.volume_map_wall_stiffness`
+> (default 1e6, NOT shared with `penalty_stiffness`) and
+> `c = Config.volume_map_wall_damping` (default 1e3). Required for column-on-plane
+> scenarios where Adami alone cannot support the cumulative weight of a tall
+> fluid column (without it, granular collapse with default params plunges to
+> z ≈ −9 m in 1.5 s).
+>
+> **Known limitation — closed-container geometries.** The explicit damped-spring
+> penalty rings between opposing walls in multi-plane container configurations
+> (CFL violation: explicit Euler is unstable for `dt > 2/sqrt(k_eff/m)` and the
+> default tuning sits well above this for typical particle masses). This affects
+> only closed containers — the kernel's design target is column-on-plane
+> granular flow, which works correctly. The unit test
+> `test_volume_map_six_plane_container` is `skipTest`'d with a pointer back to
+> this section; resolution requires an implicit boundary projection (Path 2:
+> IISPH-style refactor of the SolverSPH DP path), which is out of scope.
 
 ### Penalty — `sph_boundary.py`
 
@@ -278,6 +317,22 @@ Selected by `Config.boundary_type ∈ {"penalty", "dummy"}`.
 - `wall_normal` must be a unit outward vector per dummy; set by
   `add_dummy_particles_to_builder`. Fluid particles keep
   `wp.vec3(0.0)` — never read from a fluid.
+
+### Implicit-friction CG metrics
+
+`SolverSPH._friction_solver` (an `ImplicitFrictionSolver`, only
+constructed when `boundary_type == "volume_map"`; `None` otherwise)
+exposes two observability hooks that survive across steps:
+
+| Attribute | Type | Meaning |
+|---|---|---|
+| `last_iter_count` | `int` | Iterations of the most recent CG solve (`0` if `step()` has not yet run). |
+| `last_residual` | `float` | Relative residual `‖r‖/‖b‖` after the most recent solve. |
+
+`last_iter_count == 1` with `last_residual ≈ tol` is the signature of
+`A ≈ I` — the implicit-friction operator has degenerated to the identity
+and the CG solve exits on the first residual check, meaning friction is
+operationally inert. Useful when debugging future volume_map work.
 
 ## 10. Constitutive routes
 

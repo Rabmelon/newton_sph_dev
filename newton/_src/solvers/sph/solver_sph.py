@@ -137,6 +137,16 @@ class SolverSPH(SolverBase):
         applies tangent-projected friction (Eq. 18) — fluid slides along the boundary;
         ``True`` skips the projection so normal motion is also damped (honey-on-grid
         regime)."""
+        volume_map_wall_stiffness: float = 1.0e6
+        """Penalty stiffness for the ``volume_map`` boundary's escapee-recovery spring
+        (Path 2b · damped fallback when Adami pressure vanishes at d → 0 or |d| > 2h).
+        Tuned for column-on-plane granular scenarios where penetration stays sub-mm
+        and Adami pressure governs the bulk; in those regimes friction CG converges
+        in ≤ 2 iterations. Multi-plane container configurations cannot reach a stable
+        state with this default — see SPH/CLAUDE.md §9 known limitations."""
+        volume_map_wall_damping: float = 1.0e3
+        """Velocity damping for the ``volume_map`` penalty fallback. Mirrors the
+        ``penalty_damping`` scale; see ``volume_map_wall_stiffness``."""
         viscosity_solver_max_iter: int = 100
         """Maximum CG iterations for the implicit boundary-friction solver."""
         viscosity_solver_tol: float = 1.0e-3
@@ -288,6 +298,14 @@ class SolverSPH(SolverBase):
             config = SolverSPH.Config()
         self._config = config
 
+        # ``boundary_type == "volume_map"`` previously emitted a RuntimeWarning
+        # because the literal Bender 2020 Eq. 15 boundary-pressure form blows
+        # up under explicit WCSPH+DP (1/ρ² Tait feedback). Path 2b replaces
+        # that formula with an Adami-style mirror-pressure form
+        # (see ``sph_volume_map_kernels._eval_volume_map_pressure_accel``)
+        # which is linear in pressure and stable under explicit integration;
+        # the warning has been removed.
+
         self._sph_model = SPHModel(model, config.reference_density)
 
         # Derived parameters: smoothing length computed from spacing and ratio
@@ -331,16 +349,11 @@ class SolverSPH(SolverBase):
         self._volume_map_spheres: list[tuple[wp.transform, float]] = []
         self._volume_map_table: wp.array | None = None
         self._friction_solver: ImplicitFrictionSolver | None = None
+        self._volume_map_debug_accel: wp.array | None = None
         if config.boundary_type == "volume_map":
             self._volume_map_planes = self._extract_ground_planes()
             self._volume_map_boxes = self._extract_box_shapes()
             self._volume_map_spheres = self._extract_sphere_shapes()
-            with wp.ScopedDevice(model.device):
-                self._volume_map_table = compute_volume_map_table(
-                    self._support_radius,
-                    n_samples=config.volume_map_table_size,
-                    device=model.device,
-                )
             self._friction_solver = ImplicitFrictionSolver(
                 n=n,
                 device=model.device,
@@ -350,6 +363,41 @@ class SolverSPH(SolverBase):
             # Tentative-velocity buffer (the right-hand side ``b`` of the CG
             # solve and warm-start initial guess).
             self._friction_b = wp.zeros(n, dtype=wp.vec3, device=model.device)
+            # Per-particle debug buffer holding the maximum boundary-pressure
+            # acceleration magnitude across all volume-map shapes for the
+            # current step. Zeroed at the start of each volume-map dispatch.
+            self._volume_map_debug_accel = wp.zeros(n, dtype=float, device=model.device)
+
+        # Density-kernel boundary compensation: build the V_B(d) table and
+        # cached plane arrays whenever the boundary type is plane-based and
+        # does not put boundary particles into the neighbor list. Without
+        # this analytical compensation the Shepard ratio of fluid particles
+        # near walls would diverge once particles disperse — see Bender 2020
+        # for the V_B formulation.
+        density_walls = config.boundary_type in ("penalty", "volume_map")
+        self._density_plane_normals: wp.array | None = None
+        self._density_plane_offsets: wp.array | None = None
+        if density_walls:
+            planes = self._volume_map_planes if config.boundary_type == "volume_map" else self._ground_planes
+            with wp.ScopedDevice(model.device):
+                if self._volume_map_table is None:
+                    self._volume_map_table = compute_volume_map_table(
+                        self._support_radius,
+                        n_samples=config.volume_map_table_size,
+                        device=model.device,
+                    )
+                self._density_plane_normals, self._density_plane_offsets = self._build_plane_arrays(planes)
+        # Always provide non-None placeholder arrays for the density kernel
+        # launch, even when no wall boundary exists (kernel ignores them).
+        if self._volume_map_table is None:
+            self._volume_map_table = wp.zeros(1, dtype=float, device=model.device)
+        if self._density_plane_normals is None:
+            self._density_plane_normals = wp.zeros(1, dtype=wp.vec3, device=model.device)
+        if self._density_plane_offsets is None:
+            self._density_plane_offsets = wp.zeros(1, dtype=float, device=model.device)
+        self._density_has_walls = density_walls and len(
+            self._volume_map_planes if config.boundary_type == "volume_map" else self._ground_planes
+        ) > 0
 
         # Compute fluid particle count for optimized kernel launches.
         # Fluid particles must be contiguous at the front of the array
@@ -370,7 +418,7 @@ class SolverSPH(SolverBase):
         # must not use ``_fluid_count < n`` because the non-contiguous fallback
         # above forces ``_fluid_count = n`` even when dummies are present.
         self._has_dummies = bool(np.any(pt != 0))
-        self._density_kernel = make_compute_density_kernel(self._has_dummies)
+        self._density_kernel = make_compute_density_kernel(self._has_dummies, self._density_has_walls)
         self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(self._has_dummies)
         self._stress_force_kernel = make_compute_stress_force_kernel(self._has_dummies)
         self._artificial_viscosity_kernel = make_compute_artificial_viscosity_kernel(self._has_dummies)
@@ -403,6 +451,27 @@ class SolverSPH(SolverBase):
                 offset = -(normal[0] * px + normal[1] * py + normal[2] * pz)
                 planes.append((normal, float(offset)))
         return planes
+
+    def _build_plane_arrays(
+        self, planes: list[tuple[wp.vec3, float]]
+    ) -> tuple[wp.array, wp.array]:
+        """Pack a Python list of (normal, offset) pairs into Warp arrays.
+
+        Empty plane lists return a length-1 zero placeholder so kernels
+        that take the arrays as required parameters never receive a
+        zero-length array.
+        """
+        if len(planes) == 0:
+            normals = wp.zeros(1, dtype=wp.vec3, device=self.model.device)
+            offsets = wp.zeros(1, dtype=float, device=self.model.device)
+            return normals, offsets
+        normals_np = np.array(
+            [[n[0], n[1], n[2]] for n, _ in planes], dtype=np.float32
+        )
+        offsets_np = np.array([o for _, o in planes], dtype=np.float32)
+        normals = wp.array(normals_np, dtype=wp.vec3, device=self.model.device)
+        offsets = wp.array(offsets_np, dtype=float, device=self.model.device)
+        return normals, offsets
 
     def _extract_box_shapes(self) -> list[tuple[wp.transform, wp.vec3]]:
         """Pre-compute per-box pose and half-extents from model shapes.
@@ -476,10 +545,18 @@ class SolverSPH(SolverBase):
         if flags & SolverNotifyFlags.SHAPE_PROPERTIES:
             if self._config.boundary_type == "penalty":
                 self._ground_planes = self._extract_ground_planes()
+                self._density_plane_normals, self._density_plane_offsets = self._build_plane_arrays(
+                    self._ground_planes
+                )
+                self._density_has_walls = len(self._ground_planes) > 0
             elif self._config.boundary_type == "volume_map":
                 self._volume_map_planes = self._extract_ground_planes()
                 self._volume_map_boxes = self._extract_box_shapes()
                 self._volume_map_spheres = self._extract_sphere_shapes()
+                self._density_plane_normals, self._density_plane_offsets = self._build_plane_arrays(
+                    self._volume_map_planes
+                )
+                self._density_has_walls = len(self._volume_map_planes) > 0
 
     # ------------------------------------------------------------------
     # Main simulation step
@@ -565,6 +642,7 @@ class SolverSPH(SolverBase):
         elif self._config.boundary_type == "volume_map":
             self._apply_volume_map_pressure(
                 pos=state_in.particle_q,
+                vel=state_in.particle_qd,
                 pressure=state_out.sph.pressure,
                 density=state_in.sph.density,
             )
@@ -657,6 +735,7 @@ class SolverSPH(SolverBase):
         elif self._config.boundary_type == "volume_map":
             self._apply_volume_map_pressure(
                 pos=self._pos_mid,
+                vel=state_in.particle_qd,
                 pressure=state_out.sph.pressure,
                 density=state_out.sph.density,
             )
@@ -737,6 +816,9 @@ class SolverSPH(SolverBase):
                 self._h,
                 self._support_radius,
                 self._config.reference_density,
+                self._density_plane_normals,
+                self._density_plane_offsets,
+                self._volume_map_table,
             ],
             outputs=[state.sph.density],
             device=self.model.device,
@@ -972,19 +1054,25 @@ class SolverSPH(SolverBase):
     def _apply_volume_map_pressure(
         self,
         pos: wp.array[wp.vec3],
+        vel: wp.array[wp.vec3],
         pressure: wp.array[float],
         density: wp.array[float],
     ) -> None:
-        """Accumulate Bender 2020 volume-map boundary pressure into ``self._accel``.
+        """Accumulate Adami-style volume-map boundary pressure into ``self._accel``.
 
         Iterates the cached plane / box / sphere shape lists built by
         ``_extract_*_shapes`` and launches one boundary-pressure kernel
-        per shape. Each kernel reads particle pressure / density and the
-        precomputed V_B(d) table to evaluate Eq. 15 with mirroring
-        ``p~ = max(p_i, 0)`` and ``rho~ = rho₀``.
+        per shape. Each kernel reads particle pressure / density /
+        velocity and the precomputed V_B(d) table to evaluate the Adami
+        2012 mirror-pressure form
+
+        ``a = -V_B (p_i + p_b) / (rho_i rho_0) ∇W − dummy_beta · V_B / h² · max(0, -v·n) · n``
+
+        with ``p_b = max(p_i, 0) + rho_i max(0, -g·n) max(0, -d)``.
 
         Args:
             pos: World-frame particle positions [m].
+            vel: Particle velocities [m/s] (used by the wall-normal damper).
             pressure: Particle pressure ``-tr(sigma)/3`` [Pa].
             density: Particle density [kg/m³].
         """
@@ -993,7 +1081,13 @@ class SolverSPH(SolverBase):
         h = self._h
         r = self._support_radius
         rho0 = self._config.reference_density
+        gravity = self._gravity_vec
+        damping_beta = self._config.dummy_beta
+        wall_stiffness = self._config.volume_map_wall_stiffness
+        wall_damping = self._config.volume_map_wall_damping
         table = self._volume_map_table
+        debug_buf = self._volume_map_debug_accel
+        debug_buf.zero_()
 
         for normal, offset in self._volume_map_planes:
             wp.launch(
@@ -1001,6 +1095,7 @@ class SolverSPH(SolverBase):
                 dim=n,
                 inputs=[
                     pos,
+                    vel,
                     pressure,
                     density,
                     model.particle_flags,
@@ -1009,10 +1104,14 @@ class SolverSPH(SolverBase):
                     offset,
                     h,
                     r,
+                    gravity,
+                    damping_beta,
+                    wall_stiffness,
+                    wall_damping,
                     rho0,
                     table,
                 ],
-                outputs=[self._accel],
+                outputs=[self._accel, debug_buf],
                 device=model.device,
             )
         for transform, half_extents in self._volume_map_boxes:
@@ -1021,6 +1120,7 @@ class SolverSPH(SolverBase):
                 dim=n,
                 inputs=[
                     pos,
+                    vel,
                     pressure,
                     density,
                     model.particle_flags,
@@ -1029,10 +1129,14 @@ class SolverSPH(SolverBase):
                     half_extents,
                     h,
                     r,
+                    gravity,
+                    damping_beta,
+                    wall_stiffness,
+                    wall_damping,
                     rho0,
                     table,
                 ],
-                outputs=[self._accel],
+                outputs=[self._accel, debug_buf],
                 device=model.device,
             )
         for transform, radius in self._volume_map_spheres:
@@ -1041,6 +1145,7 @@ class SolverSPH(SolverBase):
                 dim=n,
                 inputs=[
                     pos,
+                    vel,
                     pressure,
                     density,
                     model.particle_flags,
@@ -1049,10 +1154,14 @@ class SolverSPH(SolverBase):
                     radius,
                     h,
                     r,
+                    gravity,
+                    damping_beta,
+                    wall_stiffness,
+                    wall_damping,
                     rho0,
                     table,
                 ],
-                outputs=[self._accel],
+                outputs=[self._accel, debug_buf],
                 device=model.device,
             )
 

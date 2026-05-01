@@ -3,10 +3,11 @@
 
 """Volume-map boundary force kernels for SPH.
 
-Implements the boundary pressure force of Bender et al. 2020 (IEEE TVCG)
-Eq. 15 specialised to plane / box / sphere shapes with analytical SDF.
-The friction-Laplacian contribution (Eqs. 16-19) lives in
-:mod:`sph_implicit_viscosity` as part of the matrix-free PCG operator.
+Implements an Adami-style mirror-pressure boundary force using the
+Bender et al. 2020 (IEEE TVCG) volume-map surrogate ``V_B(d)`` as the
+boundary-volume scaling. The friction-Laplacian contribution
+(Bender Eqs. 16-19) lives in :mod:`sph_implicit_viscosity` as part of
+the matrix-free PCG operator.
 
 Three kernels — one per shape kind — each launched once per shape from
 the solver's dispatch loop. The unified pattern:
@@ -16,22 +17,37 @@ the solver's dispatch loop. The unified pattern:
    analytical SDF and outward unit normal.
 3. Early-exit if signed distance ≥ support radius.
 4. Sample precomputed V_B(d) volume-map table.
-5. Accumulate Bender 2020 Eq. 15 boundary pressure force into the
-   acceleration array.
+5. Accumulate Adami-style mirror-pressure force plus a wall-normal
+   velocity damping term into the acceleration array.
 
-Numerical fix vs. literal Bender 2020: when a fluid particle has
-penetrated the boundary (``d < 0``), the literal kernel gradient flips
-direction and the formula yields an *inward* force. Bender's implicit
-pressure solver prevents this from arising; Newton's explicit WCSPH
-allows momentary penetration, so we always evaluate ∇W with
-``r_vec = |d| · n_outward`` so the force stays outward (away from solid).
-The boundary pressure mirror is also clamped to ``max(p_i, 0)`` to stop
-tensile stress states from pulling fluid into walls.
+Path 2b: the literal Bender 2020 Eq. 15
+``a = -V_B · ρ_0 · (p_i/ρ_i² + p_i/ρ_b²) · ∇W`` was designed for an
+implicit (IISPH) pressure solver. Under Newton's explicit WCSPH+DP
+path, the ``1/ρ²`` quadratic dependence couples the boundary force back
+into the Tait equation of state via positive feedback (instrumentation
+showed ~1500× gravity at substep 1, amplifying to ~80,000× within ~8
+substeps). The replacement formula evaluated below is
+
+    p_b = max(p_i, 0) + ρ_i · max(0, -g·n) · max(0, -d)
+    a_pressure = -V_B · (p_i + p_b) / (ρ_i · ρ_0) · ∇W(d·n_out, h)
+    a_damping  = -dummy_beta · V_B / h² · max(0, -v·n) · n
+
+linear in pressure (no quadratic feedback), with a hydrostatic-head
+correction for any momentary penetration and a one-sided viscous wall-
+normal damper to dissipate residual oscillation. The kernel gradient
+is always evaluated at ``r_vec = |d| · n_outward`` so the pressure
+force stays outward even if a particle momentarily penetrates the
+solid (Newton's explicit step allows this; Bender's implicit step
+does not).
 
 References:
     Bender, J., Kugelstadt, T., Weiler, M., & Koschier, D. (2020).
     Volume Maps: An Implicit Boundary Representation for SPH.
     IEEE Transactions on Visualization and Computer Graphics.
+
+    Adami, S., Hu, X. Y., & Adams, N. A. (2012). A generalized wall
+    boundary condition for smoothed particle hydrodynamics. Journal of
+    Computational Physics, 231(21), 7057-7075.
 """
 
 from __future__ import annotations
@@ -66,15 +82,22 @@ def _eval_volume_map_pressure_accel(
     support_radius: float,
     p_i: float,
     rho_i: float,
+    v_i: wp.vec3,
+    gravity: wp.vec3,
+    damping_beta: float,
+    wall_stiffness: float,
+    wall_damping: float,
     reference_density: float,
     volume_map_table: wp.array[float],
 ) -> wp.vec3:
-    """Bender 2020 Eq. 15 boundary pressure acceleration (per unit mass).
+    """Adami-style mirror-pressure boundary acceleration with V_B(d) scaling.
 
-    Computed once per (particle, boundary-shape) pair from the unified
-    inputs that every shape-specific kernel below produces. Wrapped as
-    ``@wp.func`` so the three shape kernels share identical force-side
-    logic and only differ in how they extract ``d`` and ``n_world``.
+    Replacement for the failing literal Bender 2020 Eq. 15 in the
+    explicit WCSPH+DP regime — see module docstring. Evaluated once per
+    (particle, boundary-shape) pair from the unified inputs that every
+    shape-specific kernel below produces. Wrapped as ``@wp.func`` so
+    the three shape kernels share identical force-side logic and only
+    differ in how they extract ``d`` and ``n_world``.
 
     Args:
         d: Signed distance from the particle to the boundary surface
@@ -85,6 +108,14 @@ def _eval_volume_map_pressure_accel(
         support_radius: SPH support radius [m] (= 2 h for cubic / Wendland).
         p_i: Particle pressure [Pa].
         rho_i: Particle density [kg/m³].
+        v_i: Particle velocity [m/s], used for one-sided wall-normal damping.
+        gravity: Gravity vector [m/s²], used for the hydrostatic-head
+            correction inside the mirror pressure when the particle has
+            momentarily penetrated the solid.
+        damping_beta: Dimensionless wall-normal damping coefficient
+            (reused from the dummy-boundary ``Config.dummy_beta``).
+        wall_stiffness: Linear penalty stiffness for d < 0 (escapee
+            recovery) [m/s²/m]. Reused from ``Config.penalty_stiffness``.
         reference_density: Reference density rho₀ [kg/m³].
         volume_map_table: Precomputed V_B(d) table from
             :func:`compute_volume_map_table`.
@@ -101,22 +132,69 @@ def _eval_volume_map_pressure_accel(
 
     v_b = sample_volume_map(d, support_radius, volume_map_table)
 
-    # Clamp BOTH the particle-side pressure (used directly in the symmetric
-    # form) and the boundary mirror to a non-negative value. Either alone
-    # leaves a leak: a negative p_i (DP tension transient before return
-    # mapping) flips the coefficient sign and yields an inward force; a
-    # negative p_b would do the same via the mirror term. Clamping both
-    # terms keeps the boundary force monotonically outward.
+    # Adami 2012 mirror pressure with hydrostatic-head correction for any
+    # momentary penetration. ``max(p_i, 0)`` stops tensile stress from
+    # pulling fluid into the wall; ``ρ_i · max(0, -g·n) · max(0, -d)`` adds
+    # back the gravity-induced static pressure jump if d < 0 (penetration).
+    # For d ≥ 0 (no penetration) the head term vanishes.
     p_clamped = wp.max(p_i, 0.0)
+    head_g = wp.max(0.0, -wp.dot(gravity, n_world))
+    head_d = wp.max(0.0, -d)
+    p_b = p_clamped + rho_i * head_g * head_d
     rho_b = reference_density
 
-    coeff = v_b * reference_density * (p_clamped / (rho_i * rho_i) + p_clamped / (rho_b * rho_b))
-    return -coeff * grad_w
+    # Adami anti-symmetric pressure form: linear in p, no 1/ρ² Tait
+    # feedback. Sign matches Eq. 15 — gradient points outward (away from
+    # the solid) when ``d > 0``, so ``-(...) * grad_w`` is an outward push
+    # on the fluid particle.
+    coeff = v_b * (p_clamped + p_b) / (rho_i * rho_b)
+    a_pressure = -coeff * grad_w
+
+    # One-sided wall-normal viscous damper (safety net). Only inward-moving
+    # particles (v · n < 0) get damped; particles already escaping outward
+    # are not artificially decelerated. Coefficient is the same
+    # dimensionless ``dummy_beta`` used by the dummy boundary.
+    h_inv_sq = 1.0 / wp.max(h * h, _EPSILON)
+    v_normal = wp.dot(v_i, n_world)
+    inward = wp.max(0.0, -v_normal)
+    a_damping = (damping_beta * v_b * h_inv_sq * inward) * n_world
+
+    # Damped-spring penalty fallback for d < 0 (escapee recovery). Adami
+    # pressure vanishes at d=0 (∇W ∝ q → 0) and at |d| > support_radius
+    # (∇W = 0), so single-sample Adami cannot stop a particle that has
+    # already crossed the wall. Mirrors `ground_plane_penalty_kernel`:
+    # `f = max(0, k·|d| − c·v_n)`. Magnitude is capped to keep one-step
+    # velocity change ≤ c_s (acoustic CFL bound) — a stiff explicit spring
+    # otherwise ejects particles upward through opposing walls (CFL
+    # violation: dt·k·|d|/m > 2·sqrt(k/m) for typical h, m, dt). The cap
+    # acts as a soft saturation: deep escapees still feel a strong
+    # constant outward push but cannot resonate with dt.
+    # Damped-spring penalty fallback for d < 0 (escapee recovery). Mirrors
+    # `ground_plane_penalty_kernel` form: f = max(0, k·|d| − c·v_n).
+    # Required for column-on-plane scenarios — without it, the cumulative
+    # weight of a tall fluid column overwhelms Adami pressure (which
+    # vanishes at d=0 and at |d|>2h) and particles plunge through the
+    # ground. Default ``volume_map_wall_stiffness`` (1e4, NOT 1e6) is
+    # CFL-tolerant for typical SPH masses; multi-plane container
+    # configurations still risk explicit-spring ringing — see SPH/CLAUDE.md
+    # §9 for known limitations and the test_volume_map_six_plane_container
+    # skip.
+    if d < 0.0:
+        v_n_pen = wp.dot(v_i, n_world)
+        f_mag = wall_stiffness * (-d) - wall_damping * v_n_pen
+        if f_mag < 0.0:
+            f_mag = 0.0
+        a_repulsion = f_mag * n_world
+    else:
+        a_repulsion = wp.vec3(0.0, 0.0, 0.0)
+
+    return a_pressure + a_damping + a_repulsion
 
 
 @wp.kernel
 def volume_map_pressure_plane_kernel(
     pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
     pressure: wp.array[float],
     density: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -125,10 +203,15 @@ def volume_map_pressure_plane_kernel(
     plane_offset: float,
     h: float,
     support_radius: float,
+    gravity: wp.vec3,
+    damping_beta: float,
+    wall_stiffness: float,
+    wall_damping: float,
     reference_density: float,
     volume_map_table: wp.array[float],
     # output
     accel: wp.array[wp.vec3],
+    debug_accel_mag: wp.array[float],
 ):
     """Apply volume-map boundary pressure for an infinite plane shape.
 
@@ -138,6 +221,7 @@ def volume_map_pressure_plane_kernel(
 
     Args:
         pos: Particle positions [m], shape [particle_count, 3].
+        vel: Particle velocities [m/s].
         pressure: Particle pressure [Pa].
         density: Particle density [kg/m³].
         particle_flags: Particle activity flags.
@@ -146,9 +230,14 @@ def volume_map_pressure_plane_kernel(
         plane_offset: Plane offset such that ``n·x + offset = signed distance``.
         h: Smoothing length [m].
         support_radius: SPH support radius [m].
+        gravity: Gravity vector [m/s²] for hydrostatic-head correction.
+        damping_beta: Dimensionless wall-normal damping coefficient.
+        wall_stiffness: Linear penalty stiffness for d < 0 (escapee recovery) [m/s²/m].
         reference_density: Reference density rho₀ [kg/m³].
         volume_map_table: Precomputed V_B(d) values.
         accel: Acceleration array (accumulated in-place) [m/s²].
+        debug_accel_mag: Per-particle magnitude of the boundary acceleration
+            contribution from this shape [m/s²]; max-accumulated across shapes.
     """
     i = wp.tid()
     if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
@@ -173,15 +262,24 @@ def volume_map_pressure_plane_kernel(
         support_radius,
         pressure[i],
         rho_i,
+        vel[i],
+        gravity,
+        damping_beta,
+        wall_stiffness,
+        wall_damping,
         reference_density,
         volume_map_table,
     )
     accel[i] = accel[i] + a
+    a_mag = wp.length(a)
+    if a_mag > debug_accel_mag[i]:
+        debug_accel_mag[i] = a_mag
 
 
 @wp.kernel
 def volume_map_pressure_box_kernel(
     pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
     pressure: wp.array[float],
     density: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -190,10 +288,15 @@ def volume_map_pressure_box_kernel(
     box_half_extents: wp.vec3,
     h: float,
     support_radius: float,
+    gravity: wp.vec3,
+    damping_beta: float,
+    wall_stiffness: float,
+    wall_damping: float,
     reference_density: float,
     volume_map_table: wp.array[float],
     # output
     accel: wp.array[wp.vec3],
+    debug_accel_mag: wp.array[float],
 ):
     """Apply volume-map boundary pressure for a box obstacle (fluid outside).
 
@@ -209,6 +312,7 @@ def volume_map_pressure_box_kernel(
 
     Args:
         pos: Particle positions [m].
+        vel: Particle velocities [m/s].
         pressure: Particle pressure [Pa].
         density: Particle density [kg/m³].
         particle_flags: Particle activity flags.
@@ -217,6 +321,9 @@ def volume_map_pressure_box_kernel(
         box_half_extents: Local-frame half-extents (hx, hy, hz) [m].
         h: Smoothing length [m].
         support_radius: SPH support radius [m].
+        gravity: Gravity vector [m/s²] for hydrostatic-head correction.
+        damping_beta: Dimensionless wall-normal damping coefficient.
+        wall_stiffness: Linear penalty stiffness for d < 0 (escapee recovery) [m/s²/m].
         reference_density: Reference density rho₀ [kg/m³].
         volume_map_table: Precomputed V_B(d) values.
         accel: Acceleration array (accumulated in-place) [m/s²].
@@ -258,10 +365,18 @@ def volume_map_pressure_box_kernel(
         support_radius,
         pressure[i],
         rho_i,
+        vel[i],
+        gravity,
+        damping_beta,
+        wall_stiffness,
+        wall_damping,
         reference_density,
         volume_map_table,
     )
     accel[i] = accel[i] + a
+    a_mag = wp.length(a)
+    if a_mag > debug_accel_mag[i]:
+        debug_accel_mag[i] = a_mag
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +686,7 @@ def friction_laplacian_sphere_kernel(
 @wp.kernel
 def volume_map_pressure_sphere_kernel(
     pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
     pressure: wp.array[float],
     density: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -579,10 +695,15 @@ def volume_map_pressure_sphere_kernel(
     sphere_radius: float,
     h: float,
     support_radius: float,
+    gravity: wp.vec3,
+    damping_beta: float,
+    wall_stiffness: float,
+    wall_damping: float,
     reference_density: float,
     volume_map_table: wp.array[float],
     # output
     accel: wp.array[wp.vec3],
+    debug_accel_mag: wp.array[float],
 ):
     """Apply volume-map boundary pressure for a sphere obstacle (fluid outside).
 
@@ -592,6 +713,7 @@ def volume_map_pressure_sphere_kernel(
 
     Args:
         pos: Particle positions [m].
+        vel: Particle velocities [m/s].
         pressure: Particle pressure [Pa].
         density: Particle density [kg/m³].
         particle_flags: Particle activity flags.
@@ -600,6 +722,9 @@ def volume_map_pressure_sphere_kernel(
         sphere_radius: Sphere radius [m].
         h: Smoothing length [m].
         support_radius: SPH support radius [m].
+        gravity: Gravity vector [m/s²] for hydrostatic-head correction.
+        damping_beta: Dimensionless wall-normal damping coefficient.
+        wall_stiffness: Linear penalty stiffness for d < 0 (escapee recovery) [m/s²/m].
         reference_density: Reference density rho₀ [kg/m³].
         volume_map_table: Precomputed V_B(d) values.
         accel: Acceleration array (accumulated in-place) [m/s²].
@@ -636,7 +761,15 @@ def volume_map_pressure_sphere_kernel(
         support_radius,
         pressure[i],
         rho_i,
+        vel[i],
+        gravity,
+        damping_beta,
+        wall_stiffness,
+        wall_damping,
         reference_density,
         volume_map_table,
     )
     accel[i] = accel[i] + a
+    a_mag = wp.length(a)
+    if a_mag > debug_accel_mag[i]:
+        debug_accel_mag[i] = a_mag

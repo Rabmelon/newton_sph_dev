@@ -56,7 +56,7 @@ class Example:
                 slip_type=args.dummy_slip_type,
             )
         else:
-            # Penalty boundary: use ground plane
+            # Penalty / volume_map: use ground plane
             builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
 
         self.model = builder.finalize()
@@ -74,6 +74,8 @@ class Example:
         config.sound_speed = args.sound_speed
         config.penalty_stiffness = args.penalty_stiffness
         config.boundary_type = args.boundary_type
+        config.boundary_friction_viscosity = args.boundary_friction_viscosity
+        config.boundary_sticky = args.boundary_sticky
 
         # Set per-particle material attributes
         for attr in ("young_modulus", "poisson_ratio", "friction", "cohesion", "viscosity"):
@@ -117,10 +119,6 @@ class Example:
                 # Signal the examples runner to quit if it supports this pattern
                 if hasattr(self.viewer, "should_close"):
                     self.viewer.should_close = True
-
-        # Additionally stop the simulation once 0.1 seconds of simulated time is reached
-        if self.sim_time >= 0.1:
-            raise SystemExit("Reached 0.1s of simulated time, stopping simulation.")
 
     def test_final(self):
         h = self.solver.smoothing_length
@@ -218,9 +216,20 @@ class Example:
         parser.add_argument("--simulation-method", type=str, default="dp", choices=["dp", "mui"])
         parser.add_argument("--sound-speed", type=float, default=50.0)
         parser.add_argument("--artificial-viscosity-alpha", type=float, default=0.1)
-        parser.add_argument("--boundary-type", type=str, default="penalty", choices=["penalty", "dummy"])
+        parser.add_argument("--boundary-type", type=str, default="penalty", choices=["penalty", "dummy", "volume_map"])
         parser.add_argument("--penalty-stiffness", type=float, default=1.0e6)
         parser.add_argument("--dummy-slip-type", type=str, default="noslip", choices=["noslip", "freeslip"])
+        parser.add_argument(
+            "--boundary-friction-viscosity",
+            type=float,
+            default=0.1,
+            help="Volume_map: implicit friction viscosity coefficient (Bender 2020 Eq.16).",
+        )
+        parser.add_argument(
+            "--boundary-sticky",
+            action="store_true",
+            help="Volume_map: stick (no tangential motion). Default sliding.",
+        )
 
         # Material
         parser.add_argument("--density", type=float, default=2500.0)

@@ -24,6 +24,7 @@ from .sph_dummy_boundary import (
     compute_virtual_stress,
     compute_virtual_velocity,
 )
+from .sph_volume_map import sample_volume_map
 
 wp.set_module_options({"enable_backward": False})
 
@@ -548,11 +549,31 @@ def integrate_verlet_final_kernel(
 _SPECIALIZED_KERNEL_OPTIONS_PHASE_A = {"fast_math": True, "enable_backward": False}
 
 
-def make_compute_density_kernel(has_dummies: bool):
-    """Factory for a Shepard-corrected density kernel specialized on ``has_dummies``."""
+def make_compute_density_kernel(has_dummies: bool, has_walls: bool = False):
+    """Factory for a Shepard-corrected density kernel specialized on boundary type.
+
+    Two compile-time switches:
+
+    - ``has_dummies``: enables the dummy-neighbor fallback that substitutes
+      ``reference_density`` when a neighbor's previous-step density is
+      not yet populated (first-step / dummy particles).
+    - ``has_walls``: enables an analytical surface-integral compensation
+      term added to both the numerator (Sigma m W) and denominator
+      (Sigma V W) of the Shepard ratio. Required when ``boundary_type``
+      is ``'penalty'`` or ``'volume_map'`` because those treatments
+      do not put boundary particles into the neighbor list, so the
+      kernel-support truncation against the wall would otherwise let
+      the Shepard ratio diverge once particles disperse. The boundary
+      contribution is modelled as a single virtual particle at the
+      closest-point distance ``d`` carrying mass ``rho_0 V_B(d)`` and
+      volume ``V_B(d)``, where ``V_B`` is the Bender 2020 volume-map
+      table. Dummy-boundary models do not need this compensation
+      because their dummy particles already span the truncated kernel
+      support.
+    """
 
     @fem.cache.dynamic_kernel(
-        suffix=has_dummies,
+        suffix=(has_dummies, has_walls),
         kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
     )
     def compute_density_kernel_impl(
@@ -565,6 +586,9 @@ def make_compute_density_kernel(has_dummies: bool):
         h: float,
         support_radius: float,
         reference_density: float,
+        plane_normals: wp.array[wp.vec3],
+        plane_offsets: wp.array[float],
+        volume_map_table: wp.array[float],
         density: wp.array[float],
     ):
         i = wp.tid()
@@ -593,6 +617,19 @@ def make_compute_density_kernel(has_dummies: bool):
                     elif wp.static(has_dummies):
                         if particle_type[j] != SPH_FLUID and reference_density > _EPSILON:
                             shepard_sum += (mass[j] / reference_density) * W
+
+        if wp.static(has_walls):
+            n_planes = plane_normals.shape[0]
+            for k in range(n_planes):
+                n_k = plane_normals[k]
+                d = wp.dot(n_k, xi) + plane_offsets[k]
+                if d < support_radius:
+                    v_b = sample_volume_map(d, support_radius, volume_map_table)
+                    if v_b > 0.0:
+                        r_eval = wp.abs(d)
+                        W_b = wendland_c2_3d(r_eval, h)
+                        rho += reference_density * v_b * W_b
+                        shepard_sum += v_b * W_b
 
         if shepard_sum > _EPSILON:
             density[i] = rho / shepard_sum
