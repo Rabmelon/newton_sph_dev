@@ -22,6 +22,7 @@ class Example:
         self.fps = args.fps
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
+        self.sim_step = 0
         # Simulation duration (seconds)
         self.sim_duration = args.duration
         # How to behave when the simulation ends
@@ -106,19 +107,26 @@ class Example:
             self.state_0.clear_forces()
             self.solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
+            self.sim_step += 1
+            self.sim_time += self.sim_dt
 
     def step(self):
         self.simulate()
-        self.sim_time += self.frame_dt
-        # Print simulation progress to the command line
-        print(f"sim step: {getattr(self, 'step_count', 0)}, time: {self.sim_time:.6f}s", flush=True)
+        n = self.fluid_count
+        pos = self.state_0.particle_q.numpy()[:n]
+        vel = self.state_0.particle_qd.numpy()[:n]
+        mass = self.model.particle_mass.numpy()[:n]
+        runout = float(np.max(np.linalg.norm(pos[:, :2], axis=1))) if n else 0.0
+        height = float(np.max(pos[:, 2])) if n else 0.0
+        ke = 0.5 * float(np.sum(mass * np.einsum("ij,ij->i", vel, vel)))
+        print(
+            f"sim step: {self.sim_step}, time: {self.sim_time:.6f}s, "
+            f"runout: {runout:.3f} m, height: {height:.3f} m, KE: {ke:.3f} J",
+            flush=True,
+        )
 
-        # Check if we've reached or exceeded the target duration
         if self.sim_time >= self.sim_duration:
-            if self.end_behavior == "exit":
-                # Signal the examples runner to quit if it supports this pattern
-                if hasattr(self.viewer, "should_close"):
-                    self.viewer.should_close = True
+            raise SystemExit(f"Reached sim_duration={self.sim_duration}s, stopping simulation.")
 
     def test_final(self):
         h = self.solver.smoothing_length
