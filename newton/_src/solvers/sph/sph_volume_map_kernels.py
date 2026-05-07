@@ -53,6 +53,7 @@ References:
 from __future__ import annotations
 
 import warp as wp
+import warp.fem as fem
 
 from ...geometry import ParticleFlags
 from ...geometry.kernels import sdf_box, sdf_box_grad, sdf_sphere, sdf_sphere_grad
@@ -61,6 +62,8 @@ from .sph_kernels import wendland_c2_grad_3d
 from .sph_volume_map import frisvad_tangent_basis, sample_volume_map
 
 wp.set_module_options({"enable_backward": False})
+
+_SPECIALIZED_KERNEL_OPTIONS_PHASE_A = {"fast_math": True, "enable_backward": False}
 
 _EPSILON = wp.constant(1.0e-8)
 # 2 (d + 2) prefactor for the SPH Laplacian in d = 3 dimensions
@@ -191,192 +194,161 @@ def _eval_volume_map_pressure_accel(
     return a_pressure + a_damping + a_repulsion
 
 
-@wp.kernel
-def volume_map_pressure_plane_kernel(
-    pos: wp.array[wp.vec3],
-    vel: wp.array[wp.vec3],
-    pressure: wp.array[float],
-    density: wp.array[float],
-    particle_flags: wp.array[wp.int32],
-    particle_type: wp.array[wp.int32],
-    plane_normal: wp.vec3,
-    plane_offset: float,
-    h: float,
-    support_radius: float,
-    gravity: wp.vec3,
-    damping_beta: float,
-    wall_stiffness: float,
-    wall_damping: float,
-    reference_density: float,
-    volume_map_table: wp.array[float],
-    # output
-    accel: wp.array[wp.vec3],
-    debug_accel_mag: wp.array[float],
-):
-    """Apply volume-map boundary pressure for an infinite plane shape.
+def make_volume_map_pressure_plane_kernel(debug: bool):
+    """Factory for the plane-shape volume-map pressure kernel.
 
-    Plane is described by world-frame outward normal and offset such that
-    the signed distance is ``d = n · x + offset`` (matches the existing
-    ``ground_plane_penalty_kernel`` convention for cache compatibility).
-
-    Args:
-        pos: Particle positions [m], shape [particle_count, 3].
-        vel: Particle velocities [m/s].
-        pressure: Particle pressure [Pa].
-        density: Particle density [kg/m³].
-        particle_flags: Particle activity flags.
-        particle_type: Particle type (fluid / dummy variants).
-        plane_normal: Outward unit normal of the plane (away from solid).
-        plane_offset: Plane offset such that ``n·x + offset = signed distance``.
-        h: Smoothing length [m].
-        support_radius: SPH support radius [m].
-        gravity: Gravity vector [m/s²] for hydrostatic-head correction.
-        damping_beta: Dimensionless wall-normal damping coefficient.
-        wall_stiffness: Linear penalty stiffness for d < 0 (escapee recovery) [m/s²/m].
-        reference_density: Reference density rho₀ [kg/m³].
-        volume_map_table: Precomputed V_B(d) values.
-        accel: Acceleration array (accumulated in-place) [m/s²].
-        debug_accel_mag: Per-particle magnitude of the boundary acceleration
-            contribution from this shape [m/s²]; max-accumulated across shapes.
+    ``debug`` (compile-time): if ``True``, the kernel writes per-particle
+    max boundary-pressure acceleration magnitudes into ``debug_accel_mag``;
+    if ``False``, the write is compiled out via ``wp.static`` and the
+    buffer is untouched. Solver-side allocation is gated on the same
+    flag (``Config.debug_volume_map``).
     """
-    i = wp.tid()
-    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
-        return
-    if particle_type[i] != SPH_FLUID:
-        return
 
-    rho_i = density[i]
-    if rho_i < _EPSILON:
-        return
-
-    x = pos[i]
-    d = wp.dot(plane_normal, x) + plane_offset
-
-    if d >= support_radius:
-        return
-
-    a = _eval_volume_map_pressure_accel(
-        d,
-        plane_normal,
-        h,
-        support_radius,
-        pressure[i],
-        rho_i,
-        vel[i],
-        gravity,
-        damping_beta,
-        wall_stiffness,
-        wall_damping,
-        reference_density,
-        volume_map_table,
+    @fem.cache.dynamic_kernel(
+        suffix=(debug,),
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
     )
-    accel[i] = accel[i] + a
-    a_mag = wp.length(a)
-    if a_mag > debug_accel_mag[i]:
-        debug_accel_mag[i] = a_mag
+    def kernel_impl(
+        pos: wp.array[wp.vec3],
+        vel: wp.array[wp.vec3],
+        pressure: wp.array[float],
+        density: wp.array[float],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        plane_normal: wp.vec3,
+        plane_offset: float,
+        h: float,
+        support_radius: float,
+        gravity: wp.vec3,
+        damping_beta: float,
+        wall_stiffness: float,
+        wall_damping: float,
+        reference_density: float,
+        volume_map_table: wp.array[float],
+        # output
+        accel: wp.array[wp.vec3],
+        debug_accel_mag: wp.array[float],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            return
+        if particle_type[i] != SPH_FLUID:
+            return
+
+        rho_i = density[i]
+        if rho_i < _EPSILON:
+            return
+
+        x = pos[i]
+        d = wp.dot(plane_normal, x) + plane_offset
+
+        if d >= support_radius:
+            return
+
+        a = _eval_volume_map_pressure_accel(
+            d,
+            plane_normal,
+            h,
+            support_radius,
+            pressure[i],
+            rho_i,
+            vel[i],
+            gravity,
+            damping_beta,
+            wall_stiffness,
+            wall_damping,
+            reference_density,
+            volume_map_table,
+        )
+        accel[i] = accel[i] + a
+        if wp.static(debug):
+            a_mag = wp.length(a)
+            if a_mag > debug_accel_mag[i]:
+                debug_accel_mag[i] = a_mag
+
+    return kernel_impl
 
 
-@wp.kernel
-def volume_map_pressure_box_kernel(
-    pos: wp.array[wp.vec3],
-    vel: wp.array[wp.vec3],
-    pressure: wp.array[float],
-    density: wp.array[float],
-    particle_flags: wp.array[wp.int32],
-    particle_type: wp.array[wp.int32],
-    box_transform: wp.transform,
-    box_half_extents: wp.vec3,
-    h: float,
-    support_radius: float,
-    gravity: wp.vec3,
-    damping_beta: float,
-    wall_stiffness: float,
-    wall_damping: float,
-    reference_density: float,
-    volume_map_table: wp.array[float],
-    # output
-    accel: wp.array[wp.vec3],
-    debug_accel_mag: wp.array[float],
-):
-    """Apply volume-map boundary pressure for a box obstacle (fluid outside).
-
-    Box surface is described by ``shape_transform`` and half-extents
-    ``(hx, hy, hz)``. SDF and outward normal are evaluated in the box's
-    local frame via the geometry module's analytical helpers, then the
-    normal is rotated back to world frame for the kernel-gradient step.
-
-    Conventions:
-        - Box is treated as a SOLID OBSTACLE: ``d > 0`` outside the box,
-          ``d < 0`` inside. Fluid is expected on the outside.
-        - For a CONTAINER (fluid inside a box), build six planes instead.
-
-    Args:
-        pos: Particle positions [m].
-        vel: Particle velocities [m/s].
-        pressure: Particle pressure [Pa].
-        density: Particle density [kg/m³].
-        particle_flags: Particle activity flags.
-        particle_type: Particle type.
-        box_transform: World-frame pose of the box (3 pos + 4 quat).
-        box_half_extents: Local-frame half-extents (hx, hy, hz) [m].
-        h: Smoothing length [m].
-        support_radius: SPH support radius [m].
-        gravity: Gravity vector [m/s²] for hydrostatic-head correction.
-        damping_beta: Dimensionless wall-normal damping coefficient.
-        wall_stiffness: Linear penalty stiffness for d < 0 (escapee recovery) [m/s²/m].
-        reference_density: Reference density rho₀ [kg/m³].
-        volume_map_table: Precomputed V_B(d) values.
-        accel: Acceleration array (accumulated in-place) [m/s²].
+def make_volume_map_pressure_box_kernel(debug: bool):
+    """Factory for the box-shape volume-map pressure kernel. See
+    ``make_volume_map_pressure_plane_kernel`` for the ``debug`` semantics.
     """
-    i = wp.tid()
-    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
-        return
-    if particle_type[i] != SPH_FLUID:
-        return
 
-    rho_i = density[i]
-    if rho_i < _EPSILON:
-        return
-
-    x_world = pos[i]
-    inv_tf = wp.transform_inverse(box_transform)
-    x_local = wp.transform_point(inv_tf, x_world)
-
-    hx = box_half_extents[0]
-    hy = box_half_extents[1]
-    hz = box_half_extents[2]
-    d = sdf_box(x_local, hx, hy, hz)
-    if d >= support_radius:
-        return
-
-    n_local = sdf_box_grad(x_local, hx, hy, hz)
-    n_world = wp.transform_vector(box_transform, n_local)
-    # Defensive normalisation — sdf_box_grad axis-projection branches can
-    # leak non-unit length under the half-extent tie-break logic.
-    n_len = wp.length(n_world)
-    if n_len < _EPSILON:
-        return
-    n_world = n_world / n_len
-
-    a = _eval_volume_map_pressure_accel(
-        d,
-        n_world,
-        h,
-        support_radius,
-        pressure[i],
-        rho_i,
-        vel[i],
-        gravity,
-        damping_beta,
-        wall_stiffness,
-        wall_damping,
-        reference_density,
-        volume_map_table,
+    @fem.cache.dynamic_kernel(
+        suffix=(debug,),
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
     )
-    accel[i] = accel[i] + a
-    a_mag = wp.length(a)
-    if a_mag > debug_accel_mag[i]:
-        debug_accel_mag[i] = a_mag
+    def kernel_impl(
+        pos: wp.array[wp.vec3],
+        vel: wp.array[wp.vec3],
+        pressure: wp.array[float],
+        density: wp.array[float],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        box_transform: wp.transform,
+        box_half_extents: wp.vec3,
+        h: float,
+        support_radius: float,
+        gravity: wp.vec3,
+        damping_beta: float,
+        wall_stiffness: float,
+        wall_damping: float,
+        reference_density: float,
+        volume_map_table: wp.array[float],
+        # output
+        accel: wp.array[wp.vec3],
+        debug_accel_mag: wp.array[float],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            return
+        if particle_type[i] != SPH_FLUID:
+            return
+
+        rho_i = density[i]
+        if rho_i < _EPSILON:
+            return
+
+        x_world = pos[i]
+        inv_tf = wp.transform_inverse(box_transform)
+        x_local = wp.transform_point(inv_tf, x_world)
+
+        hx = box_half_extents[0]
+        hy = box_half_extents[1]
+        hz = box_half_extents[2]
+        d = sdf_box(x_local, hx, hy, hz)
+        if d >= support_radius:
+            return
+
+        n_local = sdf_box_grad(x_local, hx, hy, hz)
+        n_world = wp.transform_vector(box_transform, n_local)
+        n_len = wp.length(n_world)
+        if n_len < _EPSILON:
+            return
+        n_world = n_world / n_len
+
+        a = _eval_volume_map_pressure_accel(
+            d,
+            n_world,
+            h,
+            support_radius,
+            pressure[i],
+            rho_i,
+            vel[i],
+            gravity,
+            damping_beta,
+            wall_stiffness,
+            wall_damping,
+            reference_density,
+            volume_map_table,
+        )
+        accel[i] = accel[i] + a
+        if wp.static(debug):
+            a_mag = wp.length(a)
+            if a_mag > debug_accel_mag[i]:
+                debug_accel_mag[i] = a_mag
+
+    return kernel_impl
 
 
 # ---------------------------------------------------------------------------
@@ -683,93 +655,80 @@ def friction_laplacian_sphere_kernel(
     y[i] = y[i] + inc
 
 
-@wp.kernel
-def volume_map_pressure_sphere_kernel(
-    pos: wp.array[wp.vec3],
-    vel: wp.array[wp.vec3],
-    pressure: wp.array[float],
-    density: wp.array[float],
-    particle_flags: wp.array[wp.int32],
-    particle_type: wp.array[wp.int32],
-    sphere_transform: wp.transform,
-    sphere_radius: float,
-    h: float,
-    support_radius: float,
-    gravity: wp.vec3,
-    damping_beta: float,
-    wall_stiffness: float,
-    wall_damping: float,
-    reference_density: float,
-    volume_map_table: wp.array[float],
-    # output
-    accel: wp.array[wp.vec3],
-    debug_accel_mag: wp.array[float],
-):
-    """Apply volume-map boundary pressure for a sphere obstacle (fluid outside).
-
-    Conventions:
-        - Sphere is treated as a SOLID OBSTACLE: ``d > 0`` outside,
-          ``d < 0`` inside. Fluid lives outside.
-
-    Args:
-        pos: Particle positions [m].
-        vel: Particle velocities [m/s].
-        pressure: Particle pressure [Pa].
-        density: Particle density [kg/m³].
-        particle_flags: Particle activity flags.
-        particle_type: Particle type.
-        sphere_transform: World-frame pose of the sphere (3 pos + 4 quat).
-        sphere_radius: Sphere radius [m].
-        h: Smoothing length [m].
-        support_radius: SPH support radius [m].
-        gravity: Gravity vector [m/s²] for hydrostatic-head correction.
-        damping_beta: Dimensionless wall-normal damping coefficient.
-        wall_stiffness: Linear penalty stiffness for d < 0 (escapee recovery) [m/s²/m].
-        reference_density: Reference density rho₀ [kg/m³].
-        volume_map_table: Precomputed V_B(d) values.
-        accel: Acceleration array (accumulated in-place) [m/s²].
+def make_volume_map_pressure_sphere_kernel(debug: bool):
+    """Factory for the sphere-shape volume-map pressure kernel. See
+    ``make_volume_map_pressure_plane_kernel`` for the ``debug`` semantics.
     """
-    i = wp.tid()
-    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
-        return
-    if particle_type[i] != SPH_FLUID:
-        return
 
-    rho_i = density[i]
-    if rho_i < _EPSILON:
-        return
-
-    x_world = pos[i]
-    inv_tf = wp.transform_inverse(sphere_transform)
-    x_local = wp.transform_point(inv_tf, x_world)
-
-    d = sdf_sphere(x_local, sphere_radius)
-    if d >= support_radius:
-        return
-
-    n_local = sdf_sphere_grad(x_local, sphere_radius)
-    n_world = wp.transform_vector(sphere_transform, n_local)
-    n_len = wp.length(n_world)
-    if n_len < _EPSILON:
-        return
-    n_world = n_world / n_len
-
-    a = _eval_volume_map_pressure_accel(
-        d,
-        n_world,
-        h,
-        support_radius,
-        pressure[i],
-        rho_i,
-        vel[i],
-        gravity,
-        damping_beta,
-        wall_stiffness,
-        wall_damping,
-        reference_density,
-        volume_map_table,
+    @fem.cache.dynamic_kernel(
+        suffix=(debug,),
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
     )
-    accel[i] = accel[i] + a
-    a_mag = wp.length(a)
-    if a_mag > debug_accel_mag[i]:
-        debug_accel_mag[i] = a_mag
+    def kernel_impl(
+        pos: wp.array[wp.vec3],
+        vel: wp.array[wp.vec3],
+        pressure: wp.array[float],
+        density: wp.array[float],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        sphere_transform: wp.transform,
+        sphere_radius: float,
+        h: float,
+        support_radius: float,
+        gravity: wp.vec3,
+        damping_beta: float,
+        wall_stiffness: float,
+        wall_damping: float,
+        reference_density: float,
+        volume_map_table: wp.array[float],
+        # output
+        accel: wp.array[wp.vec3],
+        debug_accel_mag: wp.array[float],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            return
+        if particle_type[i] != SPH_FLUID:
+            return
+
+        rho_i = density[i]
+        if rho_i < _EPSILON:
+            return
+
+        x_world = pos[i]
+        inv_tf = wp.transform_inverse(sphere_transform)
+        x_local = wp.transform_point(inv_tf, x_world)
+
+        d = sdf_sphere(x_local, sphere_radius)
+        if d >= support_radius:
+            return
+
+        n_local = sdf_sphere_grad(x_local, sphere_radius)
+        n_world = wp.transform_vector(sphere_transform, n_local)
+        n_len = wp.length(n_world)
+        if n_len < _EPSILON:
+            return
+        n_world = n_world / n_len
+
+        a = _eval_volume_map_pressure_accel(
+            d,
+            n_world,
+            h,
+            support_radius,
+            pressure[i],
+            rho_i,
+            vel[i],
+            gravity,
+            damping_beta,
+            wall_stiffness,
+            wall_damping,
+            reference_density,
+            volume_map_table,
+        )
+        accel[i] = accel[i] + a
+        if wp.static(debug):
+            a_mag = wp.length(a)
+            if a_mag > debug_accel_mag[i]:
+                debug_accel_mag[i] = a_mag
+
+    return kernel_impl

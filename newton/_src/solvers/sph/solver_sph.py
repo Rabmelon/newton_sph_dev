@@ -61,9 +61,9 @@ from .sph_volume_map_kernels import (
     friction_laplacian_box_kernel,
     friction_laplacian_plane_kernel,
     friction_laplacian_sphere_kernel,
-    volume_map_pressure_box_kernel,
-    volume_map_pressure_plane_kernel,
-    volume_map_pressure_sphere_kernel,
+    make_volume_map_pressure_box_kernel,
+    make_volume_map_pressure_plane_kernel,
+    make_volume_map_pressure_sphere_kernel,
 )
 
 
@@ -154,6 +154,14 @@ class SolverSPH(SolverBase):
         (``||r||/||b|| < tol``)."""
         volume_map_table_size: int = 256
         """Number of samples in the precomputed V_B(d) volume-map table."""
+        debug_volume_map: bool = False
+        """If ``True``, the ``volume_map`` boundary kernels write per-particle
+        max boundary-pressure acceleration magnitudes into a debug buffer
+        (``solver._volume_map_debug_accel``), zeroed at the start of each
+        dispatch. The write is compile-erased via ``wp.static`` when ``False``,
+        so leaving this off has zero runtime cost. Used historically to
+        diagnose the Bender Eq. 15 blow-up that motivated Path 2b — keep off
+        unless reproducing a similar instability."""
 
         # --- Corrections ---
         xsph_epsilon: float = 0.0
@@ -350,6 +358,9 @@ class SolverSPH(SolverBase):
         self._volume_map_table: wp.array | None = None
         self._friction_solver: ImplicitFrictionSolver | None = None
         self._volume_map_debug_accel: wp.array | None = None
+        self._volume_map_pressure_plane_kernel = None
+        self._volume_map_pressure_box_kernel = None
+        self._volume_map_pressure_sphere_kernel = None
         if config.boundary_type == "volume_map":
             self._volume_map_planes = self._extract_ground_planes()
             self._volume_map_boxes = self._extract_box_shapes()
@@ -360,13 +371,16 @@ class SolverSPH(SolverBase):
                 max_iter=config.viscosity_solver_max_iter,
                 tol=config.viscosity_solver_tol,
             )
-            # Tentative-velocity buffer (the right-hand side ``b`` of the CG
-            # solve and warm-start initial guess).
             self._friction_b = wp.zeros(n, dtype=wp.vec3, device=model.device)
-            # Per-particle debug buffer holding the maximum boundary-pressure
-            # acceleration magnitude across all volume-map shapes for the
-            # current step. Zeroed at the start of each volume-map dispatch.
-            self._volume_map_debug_accel = wp.zeros(n, dtype=float, device=model.device)
+            debug = config.debug_volume_map
+            self._volume_map_pressure_plane_kernel = make_volume_map_pressure_plane_kernel(debug)
+            self._volume_map_pressure_box_kernel = make_volume_map_pressure_box_kernel(debug)
+            self._volume_map_pressure_sphere_kernel = make_volume_map_pressure_sphere_kernel(debug)
+            # When the debug flag is off the kernel write is compile-erased
+            # via wp.static, so the buffer is never read or written. Keep a
+            # 1-elem placeholder so the kernel arg is still a valid wp.array.
+            debug_size = n if debug else 1
+            self._volume_map_debug_accel = wp.zeros(debug_size, dtype=float, device=model.device)
 
         # Density-kernel boundary compensation: build the V_B(d) table and
         # cached plane arrays whenever the boundary type is plane-based and
@@ -395,9 +409,10 @@ class SolverSPH(SolverBase):
             self._density_plane_normals = wp.zeros(1, dtype=wp.vec3, device=model.device)
         if self._density_plane_offsets is None:
             self._density_plane_offsets = wp.zeros(1, dtype=float, device=model.device)
-        self._density_has_walls = density_walls and len(
-            self._volume_map_planes if config.boundary_type == "volume_map" else self._ground_planes
-        ) > 0
+        self._density_has_walls = (
+            density_walls
+            and len(self._volume_map_planes if config.boundary_type == "volume_map" else self._ground_planes) > 0
+        )
 
         # Compute fluid particle count for optimized kernel launches.
         # Fluid particles must be contiguous at the front of the array
@@ -452,9 +467,7 @@ class SolverSPH(SolverBase):
                 planes.append((normal, float(offset)))
         return planes
 
-    def _build_plane_arrays(
-        self, planes: list[tuple[wp.vec3, float]]
-    ) -> tuple[wp.array, wp.array]:
+    def _build_plane_arrays(self, planes: list[tuple[wp.vec3, float]]) -> tuple[wp.array, wp.array]:
         """Pack a Python list of (normal, offset) pairs into Warp arrays.
 
         Empty plane lists return a length-1 zero placeholder so kernels
@@ -465,9 +478,7 @@ class SolverSPH(SolverBase):
             normals = wp.zeros(1, dtype=wp.vec3, device=self.model.device)
             offsets = wp.zeros(1, dtype=float, device=self.model.device)
             return normals, offsets
-        normals_np = np.array(
-            [[n[0], n[1], n[2]] for n, _ in planes], dtype=np.float32
-        )
+        normals_np = np.array([[n[0], n[1], n[2]] for n, _ in planes], dtype=np.float32)
         offsets_np = np.array([o for _, o in planes], dtype=np.float32)
         normals = wp.array(normals_np, dtype=wp.vec3, device=self.model.device)
         offsets = wp.array(offsets_np, dtype=float, device=self.model.device)
@@ -545,9 +556,7 @@ class SolverSPH(SolverBase):
         if flags & SolverNotifyFlags.SHAPE_PROPERTIES:
             if self._config.boundary_type == "penalty":
                 self._ground_planes = self._extract_ground_planes()
-                self._density_plane_normals, self._density_plane_offsets = self._build_plane_arrays(
-                    self._ground_planes
-                )
+                self._density_plane_normals, self._density_plane_offsets = self._build_plane_arrays(self._ground_planes)
                 self._density_has_walls = len(self._ground_planes) > 0
             elif self._config.boundary_type == "volume_map":
                 self._volume_map_planes = self._extract_ground_planes()
@@ -1091,7 +1100,7 @@ class SolverSPH(SolverBase):
 
         for normal, offset in self._volume_map_planes:
             wp.launch(
-                volume_map_pressure_plane_kernel,
+                self._volume_map_pressure_plane_kernel,
                 dim=n,
                 inputs=[
                     pos,
@@ -1116,7 +1125,7 @@ class SolverSPH(SolverBase):
             )
         for transform, half_extents in self._volume_map_boxes:
             wp.launch(
-                volume_map_pressure_box_kernel,
+                self._volume_map_pressure_box_kernel,
                 dim=n,
                 inputs=[
                     pos,
@@ -1141,7 +1150,7 @@ class SolverSPH(SolverBase):
             )
         for transform, radius in self._volume_map_spheres:
             wp.launch(
-                volume_map_pressure_sphere_kernel,
+                self._volume_map_pressure_sphere_kernel,
                 dim=n,
                 inputs=[
                     pos,
