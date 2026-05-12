@@ -85,57 +85,6 @@ def wendland_c2_grad_3d(r_vec: wp.vec3, r: float, h: float) -> wp.vec3:
 
 
 # ---------------------------------------------------------------------------
-# Cubic spline kernel (3D)
-# ---------------------------------------------------------------------------
-
-
-@wp.func
-def cubic_spline_3d(r: float, h: float) -> float:
-    """Cubic spline smoothing kernel in 3-D.
-
-    Args:
-        r: Distance between two particles [m].
-        h: Smoothing length [m].
-
-    Returns:
-        Kernel value W(r, h).
-    """
-    q = r / h
-    alpha = 1.0 / (_PI * h * h * h)
-    if q >= 2.0:
-        return 0.0
-    elif q >= 1.0:
-        t = 2.0 - q
-        return alpha * (t * t * t) / 6.0
-    else:
-        return alpha * (2.0 / 3.0 - q * q + 0.5 * q * q * q)
-
-
-@wp.func
-def cubic_spline_grad_3d(r_vec: wp.vec3, r: float, h: float) -> wp.vec3:
-    """Gradient of the cubic spline kernel in 3-D.
-
-    Args:
-        r_vec: Vector from particle j to particle i (x_i - x_j).
-        r: |r_vec|, distance between particles.
-        h: Smoothing length.
-
-    Returns:
-        Gradient vector nabla_i W(r, h).
-    """
-    q = r / h
-    if q >= 2.0 or r < _EPSILON:
-        return wp.vec3(0.0)
-    alpha = 1.0 / (_PI * h * h * h)
-    if q >= 1.0:
-        t = 2.0 - q
-        dWdr = alpha * (-0.5 * t * t) / h
-    else:
-        dWdr = alpha * (-2.0 * q + 1.5 * q * q) / h
-    return dWdr * (r_vec / r)
-
-
-# ---------------------------------------------------------------------------
 # Density summation kernel
 # ---------------------------------------------------------------------------
 
