@@ -17,6 +17,7 @@ from __future__ import annotations
 import warp as wp
 
 from ...geometry import ParticleFlags
+from .sph_dummy_boundary import SPH_FLUID
 
 wp.set_module_options({"enable_backward": False})
 
@@ -28,6 +29,7 @@ def ground_plane_penalty_kernel(
     pos: wp.array[wp.vec3],
     vel: wp.array[wp.vec3],
     particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
     plane_normal: wp.vec3,
     plane_offset: float,
     ke: float,
@@ -54,6 +56,7 @@ def ground_plane_penalty_kernel(
         pos: Particle positions.
         vel: Particle velocities.
         particle_flags: Particle activity flags.
+        particle_type: Particle type tags; dummy particles are skipped.
         plane_normal: Outward normal of the ground plane.
         plane_offset: Plane offset (d in ax + by + cz + d = 0).
         ke: Penalty stiffness [N/m per unit mass -> m/s^2 per m penetration].
@@ -63,6 +66,8 @@ def ground_plane_penalty_kernel(
     """
     i = wp.tid()
     if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if particle_type[i] != SPH_FLUID:
         return
 
     x = pos[i]

@@ -427,7 +427,7 @@ def xsph_correction_kernel(
             xj = pos[j]
             r_vec = xi - xj
             r = wp.length(r_vec)
-            if r < support_radius:
+            if r < support_radius and r > _EPSILON:
                 vj = vel[j]
                 rho_j = density[j]
                 if particle_type[j] != SPH_FLUID:
@@ -896,7 +896,7 @@ def make_xsph_correction_kernel(has_dummies: bool):
                 xj = pos[j]
                 r_vec = xi - xj
                 r = wp.length(r_vec)
-                if r < support_radius:
+                if r < support_radius and r > _EPSILON:
                     vj = vel[j]
                     rho_j = density[j]
                     if wp.static(has_dummies):

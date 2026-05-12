@@ -816,6 +816,7 @@ class SolverSPH(SolverBase):
                     positions,
                     velocities,
                     self.model.particle_flags,
+                    self._particle_type,
                     normal,
                     offset,
                     self._config.penalty_stiffness,
