@@ -73,8 +73,6 @@ class SolverSPH(SolverBase):
         """Initial inter-particle distance dx [m]. Controls resolution."""
         kh: float = 1.3
         """Smoothing-length ratio: h = kh * particle_spacing."""
-        kernel_type: str = "wendland_c2"
-        """SPH kernel function: ``'wendland_c2'`` or ``'cubic_spline'``."""
         support_radius_factor: float = 2.0
         """Support radius = support_radius_factor * smoothing_length."""
 
@@ -111,18 +109,12 @@ class SolverSPH(SolverBase):
         """SDF penalty boundary damping [N*s/m]."""
         boundary_friction: float = 0.5
         """Coulomb friction coefficient mu for penalty boundary surfaces."""
-        restitution: float = 0.3
-        """Domain boundary inelastic collision restitution coefficient."""
         dummy_beta: float = 1.7
         """Distance-based dummy boundary extrapolation factor."""
 
         # --- Corrections ---
         xsph_epsilon: float = 0.0
         """XSPH velocity smoothing factor (0 = off, 1 = full)."""
-
-        # --- Granular damping ---
-        viscous_damping: float = 0.0
-        """Viscous damping factor: F_d = -eps * sqrt(E / (rho * h^2)) * v."""
 
         def __post_init__(self) -> None:
             supported_simulation_methods = {"dp", "mui"}
@@ -156,9 +148,7 @@ class SolverSPH(SolverBase):
             - ``sph:poisson_ratio``: Poisson's ratio
             - ``sph:friction``: Internal friction angle [rad]
             - ``sph:cohesion``: Cohesion [Pa]
-            - ``sph:dilatancy``: Dilatancy angle [rad]
             - ``sph:viscosity``: Dynamic viscosity [Pa*s]
-            - ``sph:yield_pressure``: Yield pressure cap [Pa]
             - ``sph:particle_type``: Particle type (0=fluid, 1=dummy no-slip, 2=dummy free-slip)
             - ``sph:wall_normal``: Outward wall normal for dummy particles
 
@@ -181,9 +171,7 @@ class SolverSPH(SolverBase):
             ("poisson_ratio", wp.float32, 0.3),
             ("friction", wp.float32, 0.5),
             ("cohesion", wp.float32, 0.0),
-            ("dilatancy", wp.float32, 0.0),
             ("viscosity", wp.float32, 0.0),
-            ("yield_pressure", wp.float32, 1.0e12),
             ("particle_type", wp.int32, 0),
             ("wall_normal", wp.vec3, wp.vec3(0.0)),
         ]:
@@ -685,7 +673,6 @@ class SolverSPH(SolverBase):
                 self.model.sph.poisson_ratio,
                 self.model.sph.friction,
                 self.model.sph.cohesion,
-                self.model.sph.dilatancy,
                 self.model.particle_flags,
                 self._particle_type,
                 dt,
