@@ -24,3 +24,4 @@ coverage/
 
 # 朝廷档案
 .court/
+.claude/.court/
