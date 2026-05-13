@@ -208,8 +208,51 @@ def step_response_control_kernel(
     newton_ctrl[i] = val
 
 
+@wp.kernel
+def step_response_joint_target_kernel(
+    joint_target_pos: wp.array[wp.float32],  # type: ignore[valid-type]
+    joint_target_vel: wp.array[wp.float32],  # type: ignore[valid-type]
+    mjc_actuator_ctrl_source: wp.array[wp.int32],  # type: ignore[valid-type]
+    mjc_actuator_to_newton_idx: wp.array[wp.int32],  # type: ignore[valid-type]
+    target: wp.float32,
+    num_actuators: int,
+    dofs_per_world: int,
+):
+    """Mirror step_response_control_kernel into joint_target_{pos,vel}.
+
+    Newton's SolverMuJoCo routes actuator inputs from the array each
+    actuator's ctrl_source points to (mujoco.ctrl for CTRL_DIRECT,
+    joint_target_{pos,vel} for JOINT_TARGET). USD-imported MjcActuator rows
+    on joints land in JOINT_TARGET, so writing to mujoco.ctrl alone leaves
+    them at zero. This kernel mirrors the per-world target into the right
+    joint_target slot for JOINT_TARGET actuators using the same sign
+    encoding as apply_mjc_control_kernel.
+    """
+    i = wp.tid()
+    world_i = i // num_actuators
+    act_i = i % num_actuators  # type: ignore[operator]
+    if mjc_actuator_ctrl_source[act_i] != 0:  # not JOINT_TARGET
+        return
+    val = float(0.0)
+    if world_i % num_actuators == act_i:
+        val = target
+    idx = mjc_actuator_to_newton_idx[act_i]
+    if idx >= 0:
+        joint_target_pos[world_i * dofs_per_world + idx] = val
+    elif idx <= -2:
+        joint_target_vel[world_i * dofs_per_world + (-(idx + 2))] = val
+
+
 class StepResponseControlStrategy(ControlStrategy):
-    """Each world commands one actuator to a target position, others stay at zero."""
+    """Each world commands one actuator to a target position, others stay at zero.
+
+    Writes both ``Control.mujoco.ctrl`` and ``Control.joint_target_{pos,vel}`` so
+    SolverMuJoCo's actuator-routing kernel finds the target wherever each actuator's
+    ``ctrl_source`` looks. Required because USD-imported MjcActuator rows on joints
+    are JOINT_TARGET (see ``parse_usd`` for the contract); an MJCF-only test could
+    skip the joint-target writes, but writing both is harmless and keeps the
+    strategy uniform across import paths.
+    """
 
     def __init__(self, target: float = 0.3, seed: int = 42):
         super().__init__(seed)
@@ -218,13 +261,39 @@ class StepResponseControlStrategy(ControlStrategy):
         self._newton_ctrl: wp.array | None = None
         self._n: int = 0
         self._num_actuators: int = 0
+        self._joint_target_pos: wp.array | None = None
+        self._joint_target_vel: wp.array | None = None
+        self._mjc_actuator_ctrl_source: wp.array | None = None
+        self._mjc_actuator_to_newton_idx: wp.array | None = None
+        self._dofs_per_world: int = 0
 
-    def init(self, native_ctrl: wp.array, newton_ctrl: wp.array):
+    def init(
+        self,
+        native_ctrl: wp.array,
+        newton_ctrl: wp.array,
+        *,
+        newton_control: Any | None = None,
+        newton_solver: Any | None = None,
+    ):
         num_worlds, num_actuators = native_ctrl.shape
         self._native_ctrl = native_ctrl.flatten()
         self._newton_ctrl = newton_ctrl
         self._n = num_worlds * num_actuators
         self._num_actuators = num_actuators
+
+        # Set up joint-target routing when both objects are provided and the
+        # solver actually has any JOINT_TARGET actuators.
+        if (
+            newton_control is not None
+            and newton_solver is not None
+            and getattr(newton_solver, "mjc_actuator_ctrl_source", None) is not None
+            and getattr(newton_solver, "mjc_actuator_to_newton_idx", None) is not None
+        ):
+            self._joint_target_pos = newton_control.joint_target_pos
+            self._joint_target_vel = newton_control.joint_target_vel
+            self._mjc_actuator_ctrl_source = newton_solver.mjc_actuator_ctrl_source
+            self._mjc_actuator_to_newton_idx = newton_solver.mjc_actuator_to_newton_idx
+            self._dofs_per_world = self._joint_target_pos.shape[0] // num_worlds
 
     def fill_control(self, t: float):
         if self._native_ctrl is None:
@@ -239,6 +308,20 @@ class StepResponseControlStrategy(ControlStrategy):
                 self._num_actuators,
             ],
         )
+        if self._joint_target_pos is not None:
+            wp.launch(
+                step_response_joint_target_kernel,
+                dim=self._n,
+                inputs=[
+                    self._joint_target_pos,
+                    self._joint_target_vel,
+                    self._mjc_actuator_ctrl_source,
+                    self._mjc_actuator_to_newton_idx,
+                    self.target,
+                    self._num_actuators,
+                    self._dofs_per_world,
+                ],
+            )
 
 
 # =============================================================================
@@ -1464,6 +1547,13 @@ class TestMenagerieBase(unittest.TestCase):
         Override in subclasses where DOF ordering may differ.
         """
 
+    def _compare_qD_structure(self, newton_mjw: Any, native_mjw: Any) -> None:
+        """Compare sparse RNE derivative D-structure (qD_fullm_i, qD_fullm_j).
+
+        Default: no-op (covered by compare_mjw_models for same-order pipelines).
+        Override in subclasses where DOF ordering may differ.
+        """
+
     def _compare_compiled_fields(self, newton_mjw: Any, native_mjw: Any) -> None:
         """Compare compilation-dependent fields at relaxed tolerance.
 
@@ -1541,6 +1631,10 @@ class TestMenagerieBase(unittest.TestCase):
         # This mirrors the Newton solver's approach in SolverMuJoCo.
         mj_model.geom_margin[:] = 0.0
 
+        # Mirror SolverMuJoCo's enable_multiccd=False default. MuJoCo 3.8 turns
+        # multi-CCD on by default; Newton disables it via mjDSBL_MULTICCD.
+        mj_model.opt.disableflags |= int(_mujoco.mjtDisableBit.mjDSBL_MULTICCD)
+
         # Create mujoco_warp model/data with multiple worlds
         # Note: put_model creates arrays with nworld=1, expansion happens in _ensure_models
         mjw_model = _mujoco_warp.put_model(mj_model)
@@ -1616,6 +1710,7 @@ class TestMenagerieBase(unittest.TestCase):
         self._compare_dof_physics(self._newton_solver.mjw_model, self._native_mjw_model)
         self._compare_mass_matrix_structure(self._newton_solver.mjw_model, self._native_mjw_model)
         self._compare_tendon_jacobian_structure(self._newton_solver.mjw_model, self._native_mjw_model)
+        self._compare_qD_structure(self._newton_solver.mjw_model, self._native_mjw_model)
         self._compare_actuator_physics(self._newton_solver.mjw_model, self._native_mjw_model)
         self._compare_compiled_fields(self._newton_solver.mjw_model, self._native_mjw_model)
 
@@ -1730,9 +1825,16 @@ class TestMenagerieBase(unittest.TestCase):
         native_saved = _disable_collisions(native_mjw_model)
 
         try:
-            # Initialize step-response control
+            # Initialize step-response control. Pass the solver/control so the
+            # strategy can also write joint_target_{pos,vel} for JOINT_TARGET
+            # actuators (e.g. USD-imported MjcActuator rows on joints).
             strategy = StepResponseControlStrategy(target=self.dynamics_target)
-            strategy.init(native_mjw_data.ctrl, newton_control.mujoco.ctrl)
+            strategy.init(
+                native_mjw_data.ctrl,
+                newton_control.mujoco.ctrl,
+                newton_control=newton_control,
+                newton_solver=newton_solver,
+            )
             strategy.fill_control(0.0)
 
             # Step loop — both sides run full mujoco_warp.step() independently.
@@ -2264,15 +2366,9 @@ class TestMenagerie_AgilityCassie(TestMenagerieMJCF):
     # while native keeps False when no actuatorfrcrange is specified. Flagged as
     # "no effect" in DEFAULT_MODEL_SKIP_FIELDS, but Cassie's closed-loop dynamics
     # show a measurable divergence without this backfill (qvel step 0 diff ~2e-5).
-    # jnt_solref: Newton's solref standard->direct conversion omits the dmax
-    # (solimp[0]) factor, so its stored direct-mode values are ~11% lower
-    # stiffness/damping than native's internal values for the same MJCF input
-    # (tracked in #2515). Cassie's closed-loop limit constraints amplify this
-    # into measurable qvel divergence; backfill until the conversion is fixed.
     backfill_fields = MODEL_BACKFILL_FIELDS + [  # noqa: RUF005
         "eq_data",
         "jnt_actfrclimited",
-        "jnt_solref",
     ]
     model_skip_fields = DEFAULT_MODEL_SKIP_FIELDS | {"eq_data"}
 
