@@ -76,7 +76,7 @@ class Example:
         config.boundary_type = args.boundary_type
 
         # Set per-particle material attributes
-        for attr in ("young_modulus", "poisson_ratio", "friction", "cohesion", "dilatancy", "viscosity"):
+        for attr in ("young_modulus", "poisson_ratio", "friction", "cohesion", "viscosity"):
             key = attr.replace("-", "_")
             if hasattr(args, key):
                 getattr(self.model.sph, attr).fill_(getattr(args, key))
@@ -228,7 +228,6 @@ class Example:
         parser.add_argument("--poisson-ratio", type=float, default=0.3)
         parser.add_argument("--friction", type=float, default=0.5)
         parser.add_argument("--cohesion", type=float, default=0.0)
-        parser.add_argument("--dilatancy", type=float, default=0.0)
         parser.add_argument("--viscosity", type=float, default=0.0)
 
         return parser

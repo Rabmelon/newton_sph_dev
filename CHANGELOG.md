@@ -160,6 +160,8 @@
 ### Removed
 
 - Remove `Heightfield.finalize()` and stop storing raw pointers for heightfields in `Model.shape_source_ptr`; heightfield collision data is accessed via `Model.shape_heightfield_index` / `Model.heightfield_data` / `Model.heightfield_elevations`
+- Remove unused `SolverSPH.Config.kernel_type`, `SolverSPH.Config.restitution`, `SolverSPH.Config.viscous_damping`, `Model.sph.dilatancy`, and `Model.sph.yield_pressure`, along with the unused `cubic_spline_3d` / `cubic_spline_grad_3d` kernel functions in `newton/_src/solvers/sph/sph_kernels.py`. These knobs and helpers were declared but never wired into any kernel; downstream users hitting `AttributeError` should drop references — none had observable behavior.
+- Remove the `--dilatancy` CLI argument from `newton.examples.sph.example_sph_granular` along with the corresponding `Model.sph.dilatancy` initialization, mirroring the removal of the unused `Model.sph.dilatancy` field.
 - Remove `robot_humanoid` example in favor of `basic_plotting` which uses the same humanoid model with diagnostics visualization
 - Remove unused `SolverSPH.Config.domain_lo` and `SolverSPH.Config.domain_hi` fields; they were declared but never read. Use `SolverSPH.add_dummy_particles(bounds_lo=..., bounds_hi=...)` for domain bounds instead.
 

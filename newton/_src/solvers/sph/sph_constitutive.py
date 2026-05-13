@@ -173,7 +173,6 @@ def update_stress_dp_kernel(
     poisson_ratio: wp.array[float],
     friction: wp.array[float],
     cohesion: wp.array[float],
-    dilatancy: wp.array[float],
     particle_flags: wp.array[wp.int32],
     particle_type: wp.array[wp.int32],
     dt: float,

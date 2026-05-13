@@ -33,7 +33,7 @@ differentiable.
 | `__init__.py` | Re-export `SolverSPH` | `SolverSPH` |
 | `solver_sph.py` | Orchestrator. `Config` dataclass, neighbor build, substep dispatch, CFL, boundary dispatch, gravity + ground-plane caching, attribute registration, dummy-particle builder helper, geostatic init, CFL-dt compute | `SolverSPH`, `SolverSPH.Config`, `SolverSPH.register_custom_attributes`, `SolverSPH.add_dummy_particles`, `SolverSPH.initialize_geostatic_stress`, `SolverSPH.compute_cfl_dt`, `SolverSPH.notify_model_changed` |
 | `sph_model.py` | Thin wrapper. Holds `particle_volume = m / ρ₀` | `SPHModel` |
-| `sph_kernels.py` | Smoothing kernel `@wp.func`s and every per-particle `@wp.kernel` (density w/ Shepard, velocity gradient, strain rate, stress force, artificial viscosity, XSPH, integrators) | `wendland_c2_3d`, `wendland_c2_grad_3d`, `cubic_spline_3d`, `cubic_spline_grad_3d`, `compute_density_kernel`, `compute_velocity_gradient_kernel`, `compute_strain_rate_kernel`, `compute_stress_force_kernel`, `compute_artificial_viscosity_kernel`, `xsph_correction_kernel`, `integrate_symplectic_euler_kernel`, `half_step_position_kernel`, `integrate_verlet_final_kernel` |
+| `sph_kernels.py` | Smoothing kernel `@wp.func`s and every per-particle `@wp.kernel` (density w/ Shepard, velocity gradient, strain rate, stress force, artificial viscosity, XSPH, integrators) | `wendland_c2_3d`, `wendland_c2_grad_3d`, `compute_density_kernel`, `compute_velocity_gradient_kernel`, `compute_strain_rate_kernel`, `compute_stress_force_kernel`, `compute_artificial_viscosity_kernel`, `make_xsph_correction_kernel`, `integrate_symplectic_euler_kernel`, `half_step_position_kernel`, `integrate_verlet_final_kernel` |
 | `sph_constitutive.py` | Stress update kernels (DP + μ(I)), DP helpers, geostatic init kernel | `update_stress_dp_kernel`, `update_stress_mui_kernel`, `initialize_geostatic_stress_kernel`, `drucker_prager_params`, `dp_return_mapping`, `deviatoric_stress`, `hooke_stress_increment`, `mat33_double_contraction` |
 | `sph_boundary.py` | Penalty ground-plane kernel + Coulomb friction with damping regularisation. The actual per-plane launch loop is in `SolverSPH._apply_boundary_forces` (uses cached `_ground_planes`), **not** in this file. | `ground_plane_penalty_kernel` |
 | `sph_dummy_boundary.py` | Particle-type constants, virtual velocity/stress `@wp.func`s, CPU layered particle generator | `SPH_FLUID`, `SPH_DUMMY_NOSLIP`, `SPH_DUMMY_FREESLIP`, `compute_virtual_velocity`, `compute_virtual_stress`, `generate_dummy_particles`, `add_dummy_particles_to_builder` |
@@ -107,9 +107,7 @@ Per-particle **material** fields registered on `Model.sph.*`
 | `poisson_ratio` | `wp.float32` | `0.3` | — | — |
 | `friction` | `wp.float32` | `0.5` | rad | Internal friction angle |
 | `cohesion` | `wp.float32` | `0.0` | Pa | — |
-| `dilatancy` | `wp.float32` | `0.0` | rad | **dead** (passed to DP kernel signature, never used inside) |
 | `viscosity` | `wp.float32` | `0.0` | Pa·s | μ(I) only |
-| `yield_pressure` | `wp.float32` | `1.0e12` | Pa | **dead** |
 | `particle_type` | `wp.int32` | `0` | — | 0 fluid / 1 dummy no-slip / 2 dummy free-slip |
 | `wall_normal` | `wp.vec3` | `wp.vec3(0.0)` | unit | Required for every dummy; never read for fluids |
 
@@ -315,20 +313,9 @@ Z-up only. Skips non-fluid particles.
 
 ## 11. Dead / silently-ignored knobs
 
-Do not trust these — they compile and are accepted silently.
-
-| Knob | Declared in | Claimed purpose | Reality |
-|---|---|---|---|
-| `Config.kernel_type` | `solver_sph.py` | Pick kernel | Ignored. Only `wendland_c2_3d` is called from any `@wp.kernel`. |
-| `Config.restitution` | `solver_sph.py` | Inelastic collision restitution | Never read after construction. |
-| `Config.viscous_damping` | `solver_sph.py` | Linear velocity damping | Never read after construction. |
-| `Model.sph.dilatancy` | `register_custom_attributes` | Non-associative DP flow rule | Passed into `update_stress_dp_kernel` signature, not used inside. |
-| `Model.sph.yield_pressure` | `register_custom_attributes` | Yield-pressure cap | Never read. |
-| `cubic_spline_3d` / `cubic_spline_grad_3d` | `sph_kernels.py` | Alternate kernel | Defined, never called. |
-
-**Rule**: do not add another silently-ignored knob. Either wire it
-before exposing it, or do not expose it. If you wire one of the rows
-above, delete that row from this table.
+None at present. **Rule**: do not add silently-ignored knobs. Either
+wire a new option through to a kernel before exposing it, or do not
+expose it.
 
 ## 12. Deltas vs. `/AGENTS.md`
 

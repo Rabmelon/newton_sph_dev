@@ -85,57 +85,6 @@ def wendland_c2_grad_3d(r_vec: wp.vec3, r: float, h: float) -> wp.vec3:
 
 
 # ---------------------------------------------------------------------------
-# Cubic spline kernel (3D)
-# ---------------------------------------------------------------------------
-
-
-@wp.func
-def cubic_spline_3d(r: float, h: float) -> float:
-    """Cubic spline smoothing kernel in 3-D.
-
-    Args:
-        r: Distance between two particles [m].
-        h: Smoothing length [m].
-
-    Returns:
-        Kernel value W(r, h).
-    """
-    q = r / h
-    alpha = 1.0 / (_PI * h * h * h)
-    if q >= 2.0:
-        return 0.0
-    elif q >= 1.0:
-        t = 2.0 - q
-        return alpha * (t * t * t) / 6.0
-    else:
-        return alpha * (2.0 / 3.0 - q * q + 0.5 * q * q * q)
-
-
-@wp.func
-def cubic_spline_grad_3d(r_vec: wp.vec3, r: float, h: float) -> wp.vec3:
-    """Gradient of the cubic spline kernel in 3-D.
-
-    Args:
-        r_vec: Vector from particle j to particle i (x_i - x_j).
-        r: |r_vec|, distance between particles.
-        h: Smoothing length.
-
-    Returns:
-        Gradient vector nabla_i W(r, h).
-    """
-    q = r / h
-    if q >= 2.0 or r < _EPSILON:
-        return wp.vec3(0.0)
-    alpha = 1.0 / (_PI * h * h * h)
-    if q >= 1.0:
-        t = 2.0 - q
-        dWdr = alpha * (-0.5 * t * t) / h
-    else:
-        dWdr = alpha * (-2.0 * q + 1.5 * q * q) / h
-    return dWdr * (r_vec / r)
-
-
-# ---------------------------------------------------------------------------
 # Density summation kernel
 # ---------------------------------------------------------------------------
 
@@ -426,70 +375,6 @@ def compute_artificial_viscosity_kernel(
                         a -= mass[j] * Pi_ij * grad_w
 
     accel[i] = accel[i] + a
-
-
-# ---------------------------------------------------------------------------
-# XSPH velocity correction kernel
-# ---------------------------------------------------------------------------
-
-
-@wp.kernel
-def xsph_correction_kernel(
-    grid: wp.uint64,
-    pos: wp.array[wp.vec3],
-    vel: wp.array[wp.vec3],
-    mass: wp.array[float],
-    density: wp.array[float],
-    particle_flags: wp.array[wp.int32],
-    particle_type: wp.array[wp.int32],
-    wall_normal: wp.array[wp.vec3],
-    h: float,
-    support_radius: float,
-    epsilon: float,
-    dummy_beta: float,
-    reference_density: float,
-    # output (in-place)
-    vel_out: wp.array[wp.vec3],
-):
-    """XSPH velocity correction for stability.
-
-    .. math::
-        \\mathbf{v}_i^{\\text{corr}} = \\mathbf{v}_i
-        + \\varepsilon \\sum_j \\frac{m_j}{\\bar{\\rho}_{ij}}
-        (\\mathbf{v}_j - \\mathbf{v}_i) W_{ij}
-
-    For dummy neighbors, virtual velocity and reference density are used.
-    """
-    i = wp.tid()
-    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
-        return
-    if particle_type[i] != SPH_FLUID:
-        return
-
-    xi = pos[i]
-    vi = vel[i]
-    rho_i = density[i]
-    correction = wp.vec3(0.0)
-
-    query = wp.hash_grid_query(grid, xi, support_radius)
-    j = int(0)
-    while wp.hash_grid_query_next(query, j):
-        if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and j != i:
-            xj = pos[j]
-            r_vec = xi - xj
-            r = wp.length(r_vec)
-            if r < support_radius:
-                vj = vel[j]
-                rho_j = density[j]
-                if particle_type[j] != SPH_FLUID:
-                    vj = compute_virtual_velocity(vi, vel[j], dummy_beta, wall_normal[j], particle_type[j])
-                    rho_j = reference_density
-                rho_avg = 0.5 * (rho_i + rho_j)
-                if rho_avg > _EPSILON:
-                    w = wendland_c2_3d(r, h)
-                    correction += (mass[j] / rho_avg) * (vj - vi) * w
-
-    vel_out[i] = vi + epsilon * correction
 
 
 # ---------------------------------------------------------------------------
@@ -947,7 +832,7 @@ def make_xsph_correction_kernel(has_dummies: bool):
                 xj = pos[j]
                 r_vec = xi - xj
                 r = wp.length(r_vec)
-                if r < support_radius:
+                if r < support_radius and r > _EPSILON:
                     vj = vel[j]
                     rho_j = density[j]
                     if wp.static(has_dummies):
