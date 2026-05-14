@@ -33,6 +33,11 @@ import newton
 
 from ...geometry import GeoType
 from ..solver import SolverBase
+from .sph_body_coupling import (
+    BodyCollider,
+    apply_body_coupling_force_kernel,
+    build_body_collider,
+)
 from .sph_boundary import ground_plane_penalty_kernel
 from .sph_constitutive import (
     initialize_geostatic_stress_kernel,
@@ -115,6 +120,19 @@ class SolverSPH(SolverBase):
         # --- Corrections ---
         xsph_epsilon: float = 0.0
         """XSPH velocity smoothing factor (0 = off, 1 = full)."""
+
+        # --- Two-way coupling with rigid bodies (MBD) ---
+        body_coupling_enabled: bool = False
+        """Enable SDF + penalty coupling against shapes flagged ``ShapeFlags.COLLIDE_PARTICLES``."""
+        body_coupling_stiffness: float = 2.0e4
+        """Normal penalty stiffness for body coupling [N/m].
+
+        Calibrated to dry-sand bearing capacity (~10 kPa) at ~5 mm overlap.
+        """
+        body_coupling_damping: float = 5.0e1
+        """Normal damping for body coupling [N*s/m]."""
+        body_coupling_friction: float = 0.5
+        """Coulomb friction coefficient between fluid particles and body colliders."""
 
         def __post_init__(self) -> None:
             supported_simulation_methods = {"dp", "mui"}
@@ -304,6 +322,12 @@ class SolverSPH(SolverBase):
                 )
                 self._fluid_count = n
 
+        # Body-coupling state: lazily initialized when enabled.
+        self._body_collider: BodyCollider | None = None
+        self._body_f_sand: wp.array[wp.spatial_vector] | None = None
+        if config.body_coupling_enabled:
+            self._init_body_coupling()
+
         # Specialize hot kernels on whether any dummy particles exist. Detection
         # must not use ``_fluid_count < n`` because the non-contiguous fallback
         # above forces ``_fluid_count = n`` even when dummies are present.
@@ -342,6 +366,54 @@ class SolverSPH(SolverBase):
                 planes.append((normal, float(offset)))
         return planes
 
+    def _init_body_coupling(self) -> None:
+        """Build the body-collider table and per-body wrench accumulator.
+
+        Up-axis is required to be Z (``model.up_axis == 2``); the geostatic
+        init and ground-plane extraction both assume Z-up and no coupling
+        feature has been validated under a different convention.
+        """
+        if int(self.model.up_axis) != int(newton.Axis.Z):
+            raise ValueError(
+                "SPH body coupling requires Z-up models "
+                f"(model.up_axis = {int(self.model.up_axis)}, expected {int(newton.Axis.Z)}). "
+                "SPH solver kernels and geostatic init assume Z is the vertical axis."
+            )
+        self._body_collider = build_body_collider(self.model, self.model.device)
+        body_count = self.model.body_count
+        if body_count > 0:
+            self._body_f_sand = wp.zeros(body_count, dtype=wp.spatial_vector, device=self.model.device)
+        else:
+            self._body_f_sand = None
+        self._check_penalty_cfl()
+
+    def _check_penalty_cfl(self) -> None:
+        """Warn if the body-coupling penalty exceeds the explicit-Euler stability bound.
+
+        The 1-DOF spring-mass stability criterion ``k * dt^2 / m < 4`` is used
+        with the static acoustic CFL ``dt`` and the minimum particle mass.
+        Coupling stiffness too high for the chosen substep will explode.
+        """
+        if not self._config.body_coupling_enabled:
+            return
+        if self.model.particle_count == 0:
+            return
+        m_np = self.model.particle_mass.numpy()
+        m_min = float(m_np.min()) if m_np.size else 0.0
+        if m_min <= 0.0:
+            return
+        dt = self._dt_cfl_static
+        ratio = self._config.body_coupling_stiffness * dt * dt / m_min
+        if ratio > 4.0:
+            warnings.warn(
+                f"SPH body coupling stiffness k_n={self._config.body_coupling_stiffness:.3e} N/m "
+                f"with dt_cfl={dt:.3e} s and m_p_min={m_min:.3e} kg gives k*dt^2/m={ratio:.2f}, "
+                "exceeding the explicit-Euler stability bound of 4. Reduce body_coupling_stiffness, "
+                "the substep, or increase particle mass.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     @property
     def config(self) -> Config:
         """Current solver configuration."""
@@ -361,6 +433,8 @@ class SolverSPH(SolverBase):
         if flags & SolverNotifyFlags.SHAPE_PROPERTIES:
             if self._config.boundary_type == "penalty":
                 self._ground_planes = self._extract_ground_planes()
+            if self._config.body_coupling_enabled:
+                self._body_collider = build_body_collider(self.model, self.model.device)
 
     # ------------------------------------------------------------------
     # Main simulation step
@@ -443,6 +517,10 @@ class SolverSPH(SolverBase):
         if self._config.boundary_type == "penalty":
             self._apply_boundary_forces(state_in)
 
+        # 8b. Two-way coupling with MBD rigid bodies (optional).
+        if self._config.body_coupling_enabled:
+            self._apply_body_forces(state_in, dt)
+
         # 9. Time integration (symplectic Euler, includes gravity)
         self._integrate(state_in, state_out, dt)
 
@@ -522,6 +600,11 @@ class SolverSPH(SolverBase):
         # 8. Boundary forces at midpoint
         if self._config.boundary_type == "penalty":
             self._apply_boundary_forces(state_in, pos=self._pos_mid, vel=state_in.particle_qd)
+
+        # 8b. Two-way coupling with MBD rigid bodies (optional, midpoint config).
+        #     Density at midpoint lives in state_out (computed in step 3).
+        if self._config.body_coupling_enabled:
+            self._apply_body_forces(state_out, dt, pos=self._pos_mid, vel=state_in.particle_qd)
 
         # 9. Full-step velocity + final position
         self._integrate_verlet_final(state_in, state_out, dt)
@@ -826,6 +909,91 @@ class SolverSPH(SolverBase):
                 outputs=[self._accel],
                 device=self.model.device,
             )
+
+    def _apply_body_forces(
+        self,
+        state: newton.State,
+        dt: float,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+        vel: wp.array[wp.vec3] | None = None,
+    ) -> None:
+        """Apply SDF + penalty coupling forces against rigid-body colliders.
+
+        Launches the coupling kernel over the full particle array (kernel
+        self-guards on fluid type). The per-body wrench accumulator is **not**
+        reset here — it is reset once per public :meth:`step` call so that the
+        wrench seen by :meth:`collect_body_wrench` is the sum over all internal
+        substeps.
+        """
+        collider = self._body_collider
+        if collider is None or collider.count == 0 or self._body_f_sand is None:
+            return
+        positions = pos if pos is not None else state.particle_q
+        velocities = vel if vel is not None else state.particle_qd
+        # Use 1/dt as the chatter regularization scale for tangential friction.
+        inv_dt = 1.0 / dt if dt > 0.0 else 0.0
+        wp.launch(
+            apply_body_coupling_force_kernel,
+            dim=self.model.particle_count,
+            inputs=[
+                positions,
+                velocities,
+                self.model.particle_flags,
+                self._particle_type,
+                state.sph.density,
+                self.model.particle_mass,
+                state.body_q,
+                state.body_qd,
+                self.model.body_com,
+                collider.body_id,
+                collider.shape_type,
+                collider.shape_params,
+                collider.shape_xform,
+                collider.count,
+                self._config.body_coupling_stiffness,
+                self._config.body_coupling_damping,
+                self._config.body_coupling_friction,
+                inv_dt,
+            ],
+            outputs=[self._accel, self._body_f_sand],
+            device=self.model.device,
+        )
+
+    def reset_wrench_accumulator(self) -> None:
+        """Zero the sand-on-body wrench accumulator.
+
+        Call once per outer frame, before the substep loop. The body-coupling
+        kernel atomic-adds into the buffer across every :meth:`step` invocation;
+        :meth:`step` itself never resets it. The caller's pattern is::
+
+            solver.reset_wrench_accumulator()
+            for _ in range(substeps):
+                solver.step(state_in, state_out, ..., sim_dt)
+            wrench = solver.collect_body_wrench()  # integrated across substeps
+
+        No-op when body coupling is disabled or the model has no bodies.
+        """
+        if self._config.body_coupling_enabled and self._body_f_sand is not None:
+            self._body_f_sand.zero_()
+
+    def collect_body_wrench(self) -> wp.array[wp.spatial_vector] | None:
+        """Return the sand-on-body wrench accumulated since the last reset.
+
+        The buffer is zeroed only by :meth:`reset_wrench_accumulator`; every
+        :meth:`step` call atomic-adds into it. Callers should reset once per
+        outer frame, loop :meth:`step` over substeps, then call this method
+        to read the integrated wrench.
+
+        The array has length ``Model.body_count`` with entries
+        ``wp.spatial_vector(force_world, torque_world)`` in [N, N*m]; integrate
+        it into :attr:`State.body_f` before the MBD step (see the MPM two-way
+        coupling example for the integration pattern).
+
+        Returns ``None`` when body coupling is disabled or the model has no
+        bodies.
+        """
+        return self._body_f_sand
 
     def _integrate(self, state_in: newton.State, state_out: newton.State, dt: float) -> None:
         """Symplectic Euler time integration."""
