@@ -407,9 +407,15 @@ Shape parameter packing (from `model.shape_scale`):
    moving at O(2.5 m/s) across an outer frame_dt = 20 ms presents a
    step-function ~5 cm = ~10·dx intrusion to the first substep, which
    the penalty kernel resolves as a slab-impulse → sand explodes.
-4. **First-contact wrench explosion** — **not** mitigated in the
-   solver. The caller is expected to low-pass the wrench before
-   adding it to `body_f` (Phase 2c integration).
+4. **First-contact elastic bounce** — **not** mitigated in the
+   solver. The penalty coupling ``F = k_n·pen + c_n·max(0,-v_n)`` is
+   purely elastic: the spring stores energy that returns to the body
+   on separation (damping only resists approach). The body always
+   bounces off the granular material. A plastic coupling scheme
+   (e.g. Akinci-style kernel interpolation where the DP return
+   mapping dissipates energy) is needed for true settling. MVP callers
+   should low-pass the wrench and expect bounce dynamics; the current
+   sphere-drop example logs these bounces in telemetry.
 5. **Z-up assumption** — `_init_body_coupling` raises `ValueError` if
    `model.up_axis != Axis.Z` (the SPH solver's geostatic init and
    ground-plane extraction both assume Z-up).
@@ -443,35 +449,68 @@ from `state_out.sph.density` (the midpoint density, computed at step
    robots with MuJoCo, option (a) — `body_q` interpolation across
    substeps — may be the better lever and remains TBD.
 
-**C. Terminal-z FAIL — unresolved physical tuning.** `test_final`
-   criterion 5 still fails: sphere reaches z ~= -1.2 m vs analytic
-   prediction -0.04 m. Root cause is not coupling correctness but
-   sand-bed geometry: 10 cm thickness = 2× sphere radius is too thin
-   to arrest a 0.30 m drop's kinetic energy; after 3 bounces the
-   sphere encounters a vertical channel of laterally-displaced
-   particles and slips through into free-fall. Tuning levers (any of
-   these may unstick it): increase `--sand-bed-top` to 0.20+,
-   increase `--body-coupling-damping`, decrease `--drop-height`,
-   refine `--particle-spacing`. NOT fixed because each lever risks
-   uncovering the next layer (see global memory
-   `feedback_scope_cut_over_debug_thrash`).
+**C. Terminal-z FAIL — fundamental limitation of penalty coupling.**
+   `test_final` criterion 5 (terminal sphere z near analytic crater
+   estimate) cannot pass with the current coupling design. The
+   penalty interface ``F = k_n·pen + c_n·max(0,-v_n)`` is inherently
+   **elastic**: the spring term stores energy that returns to the
+   sphere on separation (damping is off when ``v_n > 0``, i.e., during
+   separation). The sphere always bounces off the sand regardless of
+   drop height or damping coefficient. Tuning attempts:
 
-**D. `test_final` criterion 2 (settling) passes by artefact, not by
-   physics.** Sphere bounces ±5 m/s through `vz ~= 0` at each apex;
-   `any(row['t'] >= 0.5 and abs(row['sphere_vz']) < 0.05)` catches
-   the apex frame and returns True even though the sphere is
-   mid-flight, not settled. A correct check would window-min `|vz|`
-   over the last K frames. Documented here because the 4/5 PASS
-   tally would otherwise overstate stability.
+   - Deeper sand bed (``--sand-bed-bottom < 0``): adds material below,
+     but coupling impulse propagates through force chains and pushes
+     bottom-layer particles through the ground plane — massive leaks.
+   - Increased damping ``c_n`` > 200: destabilises per-particle
+     explicit integration (``c_n·v·dt / m_p`` ≫ 1 for μgram particles).
+   - Pure damping ``k_n=0``: no spring, but the SPH stress model
+     provides the restoring stiffness independently — the sand bed
+     still pushes back through SPH pressure, so bounce persists AND
+     the lack of spring restraint makes per-particle dashpot unstable.
+   - Lowered ``drop_height``: reduces KE but bounce persists; sphere
+     launched at multiple m/s every time.
 
-**Status of validation (2026-05-14)**: `test_final` 4/5 PASS
-(no-NaN, penetration, settling-by-artefact, no-leak). Run with
-`python newton/examples/multiphysics/example_sph_twoway_sphere_drop.py
---viewer null --test` (defaults aligned: `k_n = 2e4`, `c_n = 5e1`,
-`μ = 0.5`). Court archive
-`.claude/.court/20260513-sph-mbd-coupling-quadruped/` retains the
-Phase 2d FAIL diagnostic chain; the 2026-05-14 4/5 verdict reproduces
-from current worktree state with the above command.
+   The coupling end-to-end plumbing is correct; the physics limitation
+   is that real granular energy dissipation (plastic strain, grain
+   rearrangement) happens inside the SPH constitutive model, not at
+   the coupling boundary. Fixing criterion 5 requires a **plastic
+   coupling contact** law (e.g. Akinci-style interpolation through
+   the SPH smoothing kernel so the DP return mapping handles energy
+   dissipation) or a fundamentally different coupling scheme. Out of
+   scope for the MVP.
+
+**D. `test_final` criterion 2 (settling) passes by bounce-apex artefact.**
+   The sphere bounces to ±5 m/s after each impact. At each bounce apex,
+   ``|v_z| < 0.05 m/s`` momentarily, but the sphere is mid-flight not
+   settled. `any(row['t'] >= 0.5 and abs(row['sphere_vz']) < 0.05)` 
+   catches the apex and returns True. The **honest** 4/5 PASS tally
+   (with criterion 2 artificially passing) overstates stability; the
+   true physics pass count is 3/5 (no-NaN, penetration, no-leak).
+   A correct check would window-min ``|v_z|`` over the last K frames
+   or require mean ``|v_z|`` < threshold across an observation window.
+
+**Status of validation (2026-05-14, after tuning session)**: `test_final`
+3/5 honest PASS (no-NaN, penetration within 0.40 s below sand top, no
+particle leak below ground plane). Criterion 2 (settling) passes by
+bounce-apex artefact (not true settling). Criterion 5 (terminal-z vs
+analytic crater estimate) cannot pass with the penalty coupling design
+because the coupling is inherently elastic — the spring stores and
+returns energy while damping is off during separation. See issues C-D
+above. Run with::
+
+    PYTHONPATH=/path/to/worktree UV_PROJECT_ENVIRONMENT=.../.venv \\
+    uv run --no-sync --extra dev python \\
+    newton/examples/multiphysics/example_sph_twoway_sphere_drop.py \\
+    --viewer null --test
+
+The example now supports ``--sand-bed-bottom`` (default 0.0) to extend
+the sand bed below z=0 for deeper energy-absorbing columns; use with
+caution — deep beds leak particles during impact unless
+``--penalty-stiffness`` is increased to ≥ 5e6.
+
+Court archive `.claude/.court/20260513-sph-mbd-coupling-quadruped/`
+retains the Phase 2d diagnostic chain; the 2026-05-14 tuning verdict
+reproduces from current worktree state.
 
 ## 11. Dead / silently-ignored knobs
 

@@ -4,15 +4,19 @@
 """SPH-rigid two-way coupling MVP: single sphere dropped into a sand bed.
 
 .. note::
-    **2026-05-14 — Partial MVP success (4/5).** This example passes 4 of
-    5 ``test_final`` criteria after Fix A (per-substep wrench reset via
-    :meth:`SolverSPH.reset_wrench_accumulator`) and Fix B (MBD co-stepped
-    at ``sim_dt`` inside the SPH substep loop). The remaining FAIL is
-    criterion 5 (terminal sphere bottom-z vs analytic crater estimate):
-    the default 10 cm sand bed is too thin to arrest a 0.30 m drop, so
-    after 3 bounces the sphere slips through a vertical channel of
-    laterally-displaced particles. Criterion 2 (settling) passes by
-    bounce-apex artefact rather than true settling -- see
+    **2026-05-14 — Partial MVP success (3/5 honest).** This example
+    passes 3 of 5 ``test_final`` criteria after Fix A (wrench reset)
+    and Fix B (MBD co-stepped at ``sim_dt``). Criterion 2 (settling)
+    passes by bounce-apex artefact — the sphere bounces at contact and
+    ``|vz|<0.05`` is caught at the apex of flight, not during true
+    settling. Criterion 5 (terminal-z vs analytic crater estimate)
+    cannot pass because the penalty coupling ``F = k_n·pen +
+    c_n·max(0,-v_n)`` is fundamentally **elastic**: the spring stores
+    energy that returns to the sphere on separation (damping is off
+    when ``v_n>0``). True granular energy dissipation happens inside
+    the SPH Drucker-Prager constitutive model, not at the coupling
+    boundary. A plastic-coupling scheme (e.g. Akinci-style kernel
+    interpolation) is required for criterion 5. See
     ``newton/_src/solvers/sph/CLAUDE.md §10b`` for the full known-issues
     list. The SPH baseline (``test_sph``, 14/14) is unaffected.
 
@@ -47,7 +51,7 @@ Pass criteria (encoded in :meth:`Example.test_final`):
        ``drop_height = 0.30 m`` reaches the sand at t ~= 0.247 s).
     2. Sphere settles (|v_z| < 0.05 m/s by 0.5 s).
     3. No NaN in rigid state or particle state at any logged frame.
-    4. No fluid particle drifts more than ``dx`` below the floor.
+    4. No fluid particle drifts more than ``dx`` below the floor (the ground plane at ``--sand-bed-bottom``).
     5. Final sphere bottom-z lies within +/- 20 % of an analytic crater
        estimate:
 
@@ -171,7 +175,7 @@ class Example:
         # 3. Ground plane (penalty floor for SPH and rigid contacts disabled
         #    via mu=0 elsewhere -- we let SPH coupling carry the sphere,
         #    not rigid-on-plane contacts).
-        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+        builder.add_ground_plane(height=args.sand_bed_bottom, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
 
         # 4. Finalize and force Z-up gravity
         self.model = builder.finalize()
@@ -257,7 +261,7 @@ class Example:
         volume = dx**3
         mass = density * volume
 
-        lo = np.array([-0.5 * args.sand_bed_size, -0.5 * args.sand_bed_size, 0.0], dtype=np.float32)
+        lo = np.array([-0.5 * args.sand_bed_size, -0.5 * args.sand_bed_size, args.sand_bed_bottom], dtype=np.float32)
         hi = np.array(
             [0.5 * args.sand_bed_size, 0.5 * args.sand_bed_size, args.sand_bed_top],
             dtype=np.float32,
@@ -323,9 +327,9 @@ class Example:
         ke_sphere = 0.5 * self.args.sphere_mass * float(np.dot(sphere_vel, sphere_vel))
         ke_total = ke_particles + ke_sphere
 
-        # Particle leak: fluid particles below z = -dx
-        dx = self.args.particle_spacing
-        n_leak = int(np.sum(particle_q[: self.fluid_count, 2] < -dx))
+        # Particle leak: fluid particles below the floor.
+        floor_z = self.args.sand_bed_bottom - self.args.particle_spacing
+        n_leak = int(np.sum(particle_q[: self.fluid_count, 2] < floor_z))
 
         row = {
             "t": float(self.sim_time),
@@ -544,12 +548,13 @@ class Example:
                     f"{min(abs(r['sphere_vz']) for r in self.telemetry if r['t'] >= 0.5 - 1e-6):.4f} m/s)."
                 )
 
-        # 4) No particle leak through the floor.
+        # 4) No particle leak through the floor (ground plane at sand_bed_bottom).
         for row in self.telemetry:
             if row["n_particles_below_z0"] > 0:
                 raise ValueError(
                     f"Particle leak detected at t={row['t']:.4f}: "
-                    f"{int(row['n_particles_below_z0'])} particles below z=-dx."
+                    f"{int(row['n_particles_below_z0'])} particles below floor z="
+                    f"{self.args.sand_bed_bottom - self.args.particle_spacing:.4f}."
                 )
 
         # 5) Sphere terminal bottom-z within +/- 20 % of analytical reference.
@@ -588,7 +593,13 @@ class Example:
         # bump --sand-bed-size to 0.40 and --sand-bed-top to 0.15 for the full
         # validation run.
         parser.add_argument("--sand-bed-size", type=float, default=0.20, help="Sand bed X and Y extent [m].")
-        parser.add_argument("--sand-bed-top", type=float, default=0.10, help="Sand bed height above z=0 [m].")
+        parser.add_argument("--sand-bed-top", type=float, default=0.10, help="Sand bed surface z (top) [m].")
+        parser.add_argument(
+            "--sand-bed-bottom",
+            type=float,
+            default=0.0,
+            help="Sand bed floor z (bottom) [m]. Negative = deeper bed below original floor.",
+        )
         parser.add_argument("--particle-spacing", "-dx", type=float, default=0.005, help="SPH particle spacing dx [m].")
         parser.add_argument("--kh", type=float, default=1.3, help="Smoothing length ratio h = kh * dx.")
         parser.add_argument("--density", type=float, default=2500.0, help="Sand reference density [kg/m^3].")
