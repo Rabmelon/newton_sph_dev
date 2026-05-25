@@ -129,7 +129,11 @@ class SolverSPH(SolverBase):
         body_coupling_stiffness: float = 2.0e4
         """Normal penalty stiffness for body coupling [N/m].
 
-        Calibrated to dry-sand bearing capacity (~10 kPa) at ~5 mm overlap.
+        .. note::
+            Superseded by :attr:`body_coupling_bearing_capacity` since the
+            coupling now uses a plastic indentation law instead of an
+            elastic spring; this field is retained for backwards compatibility
+            with existing examples and is no longer read by the solver.
         """
         body_coupling_damping: float = 5.0e1
         """Normal damping for body coupling [N*s/m]."""
@@ -165,6 +169,14 @@ class SolverSPH(SolverBase):
             if self.boundary_type not in supported_boundary_types:
                 raise ValueError(
                     f"Invalid boundary_type: {self.boundary_type}. Must be one of {supported_boundary_types}."
+                )
+            if self.body_coupling_stiffness != 2.0e4:
+                warnings.warn(
+                    "body_coupling_stiffness is superseded by body_coupling_bearing_capacity "
+                    "and is no longer read by the solver. Update your code to use "
+                    "body_coupling_bearing_capacity instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
                 )
 
     @classmethod
@@ -409,7 +421,9 @@ class SolverSPH(SolverBase):
         ``k_eff = bearing_capacity * dA/d(pen) ~= bearing_capacity * 2*pi*R``
         (spherical contact, small penetration).  The 1-DOF spring-mass bound
         ``k * dt^2 / m < 4`` is used with the static acoustic CFL ``dt`` and
-        the minimum particle mass.
+        the minimum particle mass.  The characteristic radius is picked
+        from the actual body-collider table (max first-component of
+        ``shape_params``), falling back to 0.05 m if no collider exists.
         """
         if not self._config.body_coupling_enabled:
             return
@@ -420,11 +434,14 @@ class SolverSPH(SolverBase):
         if m_min <= 0.0:
             return
         dt = self._dt_cfl_static
-        # Effective stiffness: bearing_capacity * 2*pi*R for a sphere of
-        # characteristic radius ~ 0.05 m (typical robotics scale).
-        # This is conservative — actual contact area is smaller at
-        # first touch, so the initial effective stiffness is lower.
-        k_eff = self._config.body_coupling_bearing_capacity * 2.0 * 3.141592653589793 * 0.05
+        # Characteristic radius / half-extent from the collider table — read
+        # once at init, not in the hot path. For a sphere this is r; for a
+        # capsule it is r; for a box it is the x half-extent. The pick is
+        # the conservative max across all colliders.
+        r_char = 0.05  # fallback [m]
+        if self._body_collider is not None and len(self._body_collider.shape_params) > 0:
+            r_char = float(max(p[0] for p in self._body_collider.shape_params.numpy()))
+        k_eff = self._config.body_coupling_bearing_capacity * 2.0 * 3.141592653589793 * r_char
         ratio = k_eff * dt * dt / m_min
         if ratio > 4.0:
             warnings.warn(
@@ -980,10 +997,10 @@ class SolverSPH(SolverBase):
                 collider.shape_params,
                 collider.shape_xform,
                 collider.count,
-                self._config.body_coupling_stiffness,
                 self._config.body_coupling_damping,
                 self._config.body_coupling_friction,
                 self._config.body_coupling_bearing_capacity,
+                self._config.particle_spacing,
                 inv_dt,
             ],
             outputs=[self._accel, self._body_f_sand],

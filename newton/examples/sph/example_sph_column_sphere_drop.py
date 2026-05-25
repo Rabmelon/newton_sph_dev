@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 
+import matplotlib.pyplot as plt
 import numpy as np
 import warp as wp
 
@@ -62,6 +63,7 @@ class Example:
         self._column_top = 0.10
         sphere_radius = args.sphere_radius
         drop_z = self._column_top + args.drop_height + sphere_radius
+        self._sphere_start_z = drop_z
 
         # ---- Build model ----
         builder = newton.ModelBuilder()
@@ -72,9 +74,15 @@ class Example:
         sphere_mass = sphere_density * (4.0 / 3.0) * math.pi * sphere_radius**3
         i_scalar = 0.4 * sphere_mass * sphere_radius * sphere_radius
         inertia = wp.mat33(
-            i_scalar, 0.0, 0.0,
-            0.0, i_scalar, 0.0,
-            0.0, 0.0, i_scalar,
+            i_scalar,
+            0.0,
+            0.0,
+            0.0,
+            i_scalar,
+            0.0,
+            0.0,
+            0.0,
+            i_scalar,
         )
         self.sphere_body = builder.add_body(
             xform=wp.transform(p=wp.vec3(0.0, 0.0, drop_z), q=wp.quat_identity()),
@@ -120,10 +128,9 @@ class Example:
         cfg.boundary_friction = 0.7
         cfg.boundary_wall_friction = 0.1
         cfg.body_coupling_enabled = True
-        cfg.body_coupling_stiffness = 2.0e4
-        cfg.body_coupling_damping = 5.0e1
+        cfg.body_coupling_damping = 1.0
         cfg.body_coupling_friction = 0.5
-        cfg.body_coupling_bearing_capacity = 1.0e4
+        cfg.body_coupling_bearing_capacity = args.body_coupling_bearing_capacity
 
         self.model.sph.young_modulus.fill_(1.0e6)
         self.model.sph.poisson_ratio.fill_(0.3)
@@ -223,7 +230,7 @@ class Example:
             f"t={self.sim_time:.4f}s  v_max={max_speed:.4f} m/s  pen={pen * 1000:.2f} mm",
             flush=True,
         )
-        self._telemetry.append({"t": self.sim_time, "pen": pen})
+        self._telemetry.append({"t": self.sim_time, "pen": pen, "sphere_z": sphere_z})
 
     def step(self) -> None:
         self.simulate()
@@ -257,8 +264,6 @@ class Example:
         self.viewer.end_frame()
 
     def _plot_penetration(self) -> None:
-        import matplotlib.pyplot as plt
-
         ts = [r["t"] for r in self._telemetry]
         pens = [r["pen"] * 1000 for r in self._telemetry]
         fig, ax = plt.subplots()
@@ -291,6 +296,12 @@ class Example:
         max_pen = max((r["pen"] for r in self._telemetry), default=0.0)
         assert max_pen > 0.0, "Sphere never penetrated the granular surface"
 
+        # Plastic coupling: sphere must not rebound above its starting height.
+        max_sphere_z = max((r["sphere_z"] for r in self._telemetry), default=float("-inf"))
+        assert max_sphere_z <= self._sphere_start_z + margin, (
+            f"Sphere rebounded above starting height: max_z={max_sphere_z:.4f} m, start_z={self._sphere_start_z:.4f} m"
+        )
+
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
@@ -298,6 +309,12 @@ class Example:
         parser.add_argument("--duration", type=float, default=0.5, help="Simulation duration [s]")
         parser.add_argument("--sphere-radius", type=float, default=0.0125)
         parser.add_argument("--drop-height", type=float, default=0.05)
+        parser.add_argument(
+            "--body-coupling-bearing-capacity",
+            type=float,
+            default=5.0e4,
+            help="Plastic bearing capacity [Pa] used by the SPH-rigid coupling.",
+        )
         parser.add_argument("--plot-path", type=str, default=None)
         return parser
 

@@ -3,25 +3,31 @@
 
 """Two-way coupling between SolverSPH and rigid bodies driven by an MBD solver.
 
-Architecture: SDF + penalty per primitive collision shape
+Architecture: SDF + plastic indentation per primitive collision shape
 (sphere / capsule along local Z / axis-aligned box). For each fluid particle
-inside a body collider:
+inside a body collider, the normal force depends on the sign of the relative
+normal velocity ``v_n = (v_p - v_body_at_x) . n``:
 
-    F_n = (k_n * d + c_n * max(0, -v_rel . n)) * n     (normal penalty + damping)
-    F_t = -min(mu * |F_n|, m_p * |v_t| / dt) * v_t / |v_t|   (Coulomb)
+    Approach (v_n < 0):
+        F_n = (bearing_capacity * dx^2 + c_n * (-v_n)) * n
+    Separation (v_n >= 0):
+        F_n = 0     (no restoring spring — sand does not pull the body back)
+
+    F_t = -min(mu * |F_n|, m_p * |v_t| / dt) * v_t / |v_t|   (Coulomb, regularised)
+
+Each SPH particle acts as a quadrature point covering area ``dx^2``
+(``dx`` = ``particle_spacing``). Summing the per-particle bearing force
+``bearing_capacity * dx^2`` over the ``N`` particles inside the SDF
+recovers the Terzaghi total ``bearing_capacity * A_projected`` because
+``N * dx^2`` approximates the projected contact area. The asymmetric on/off
+law dissipates impact kinetic energy: work done by the contact during
+approach is **not** returned during separation, so a body dropped on the
+granular bed settles instead of bouncing elastically.
 
 Reaction wrench ``-F`` is applied at the contact point and atomic-added into a
 per-body :class:`wp.spatial_vector` accumulator (layout ``(linear, angular)``
 to match Newton's :attr:`State.body_f` convention). The caller integrates the
 accumulator into :attr:`State.body_f` before the MBD step.
-
-.. note::
-    The penalty coupling is fundamentally **elastic** — the spring stores energy
-    that returns to the body on separation (damping only resists approach,
-    ``c_n * max(0, -v_n)``). A plastic coupling scheme (e.g. Akinci-style
-    kernel interpolation through the SPH smoothing kernel, so the DP return
-    mapping handles dissipation) is required for true settling. See
-    ``newton/_src/solvers/sph/CLAUDE.md §10b`` for the full known-issues list.
 
 References:
     - Newton MPM ``compute_body_forces`` (``newton.examples.mpm.example_mpm_twoway_coupling``)
@@ -161,6 +167,13 @@ def _plastic_contact_area(shape_type: int, params: wp.vec3, pen: float) -> float
 
     Sphere: spherical cap projected area, saturating at full cross-section.
     Capsule / box: characteristic cross-section (order-of-magnitude estimate).
+
+    .. note::
+        Not called by :func:`apply_body_coupling_force_kernel` — that kernel
+        uses the per-particle quadrature area ``dx^2`` so that the sum over
+        all penetrating particles recovers the projected contact area
+        automatically. Kept as a utility for CFL estimation and future
+        kernels that need an explicit per-shape contact area.
     """
     if shape_type == _SHAPE_SPHERE:
         r = params[0]
@@ -195,24 +208,30 @@ def apply_body_coupling_force_kernel(
     collider_shape_xform: wp.array[wp.transform],
     n_colliders: int,
     # coupling params
-    k_n: float,
     c_n: float,
     mu: float,
     bearing_capacity: float,
+    particle_spacing: float,
     inv_mass_scale_dt: float,
     # outputs (accumulated)
     accel: wp.array[wp.vec3],
     body_f_sand: wp.array[wp.spatial_vector],
 ):
-    """Apply penalty + Coulomb coupling forces between SPH fluids and rigid bodies.
+    """Apply plastic coupling + Coulomb friction forces between SPH fluids and rigid bodies.
 
     For each fluid particle, query every collider, evaluate the analytic SDF
-    in shape-local frame, and if penetrating, apply a normal penalty + linear
-    damping force and a Coulomb tangential friction force. The equal-and-opposite
-    wrench is atomic-added to ``body_f_sand`` at the body's COM, expressed as
+    in shape-local frame, and if penetrating, apply a plastic indentation
+    force during approach (zero on separation) and a Coulomb tangential
+    friction force. The equal-and-opposite wrench is atomic-added to
+    ``body_f_sand`` at the body's COM, expressed as
     ``wp.spatial_vector(force_world, torque_world)``.
 
-    Body pose is frozen during the SPH substep loop.
+    The normal force is ``bearing_capacity * dx^2 + c_n * (-v_n)`` per
+    particle while ``v_n < 0`` (body approaching the particle), and zero
+    during separation. Summing the bearing term over the ``N`` penetrating
+    particles recovers the Terzaghi total
+    ``bearing_capacity * A_projected`` since ``N * dx^2`` approximates the
+    projected contact area. Body pose is frozen during the SPH substep loop.
 
     Args:
         particle_q: Particle positions [m].
@@ -230,11 +249,13 @@ def apply_body_coupling_force_kernel(
         collider_shape_params: Primitive dims [m] (see :class:`BodyCollider`).
         collider_shape_xform: Shape-local transform relative to parent body.
         n_colliders: Number of collider entries.
-        k_n: Normal penalty stiffness [N/m].
-        c_n: Normal damping [N*s/m].
+        c_n: Normal damping [N*s/m], active only during approach.
         mu: Coulomb friction coefficient.
-        bearing_capacity: Reserved for future plastic coupling (currently
-            unused by the elastic penalty model).
+        bearing_capacity: Plastic bearing capacity of the granular material
+            [Pa]. The approach-phase normal force per particle is
+            ``bearing_capacity * dx^2`` plus the damping term.
+        particle_spacing: SPH particle spacing ``dx`` [m]; each particle is
+            treated as a quadrature point covering area ``dx^2``.
         inv_mass_scale_dt: Tangential damping regularization scale (``1/dt``-style
             term) [1/s], used to cap friction at low slip velocities to avoid
             stick-slip chatter; see :meth:`SolverSPH._apply_body_forces`.
@@ -285,14 +306,17 @@ def apply_body_coupling_force_kernel(
         v_n = wp.dot(v_rel, n_w)
         v_t = v_rel - v_n * n_w
 
-        # Penetration depth (>= 0), force magnitudes in [N].
-        pen = -d
-
-        # Elastic coupling with approach-only damping.
-        # Damping only resists approach (v_n < 0); avoids sticky pull-out.
-        f_n_mag = k_n * pen + c_n * wp.max(0.0, -v_n)
-        if f_n_mag < 0.0:
-            f_n_mag = 0.0
+        # Plastic coupling: no restoring force on separation.
+        # Approach: bearing pressure * per-particle quadrature area + rate damping.
+        # Each particle covers dx^2, so summing over N penetrating particles
+        # yields bearing_capacity * N * dx^2 ~= bearing_capacity * A_projected
+        # (Terzaghi). Separation: zero force — no energy returned to body.
+        if v_n >= 0.0:
+            continue
+        particle_area = particle_spacing * particle_spacing
+        f_n_mag = bearing_capacity * particle_area + c_n * (-v_n)
+        if f_n_mag <= 0.0:
+            continue
         f_n = f_n_mag * n_w
 
         # Coulomb friction, regularized by a damping-like cap to avoid chatter.

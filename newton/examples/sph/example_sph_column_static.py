@@ -92,7 +92,7 @@ class Example:
         cfg.artificial_viscosity_alpha = 0.1
         cfg.penalty_stiffness = 1.0e6
         cfg.penalty_damping = 1.0e3
-        cfg.boundary_friction = 0.7       # floor
+        cfg.boundary_friction = 0.7  # floor
         cfg.boundary_wall_friction = 0.1  # lateral walls
 
         # Per-particle material parameters
@@ -180,9 +180,9 @@ class Example:
         v = self.state_0.particle_qd.numpy()
         ke = float(0.5 * np.einsum("i,ij->", self._masses_np, v * v))
         print(
-                f"substep={self._substep_count:6d}  t={self._substep_phys_time:.6f}s  KE={ke:.6e} J",
-                flush=True,
-            )
+            f"substep={self._substep_count:6d}  t={self._substep_phys_time:.6f}s  KE={ke:.6e} J",
+            flush=True,
+        )
 
     def step(self) -> None:
         self.simulate()

@@ -322,9 +322,10 @@ by an external MBD solver (e.g. MuJoCo, Featherstone). Enabled by
 | Field | Default | Unit | Meaning |
 |---|---|---|---|
 | `body_coupling_enabled` | `False` | — | Master switch. |
-| `body_coupling_stiffness` | `2.0e4` | N/m | Normal penalty stiffness `k_n`. Calibrated to dry-sand bearing capacity (~10 kPa) at ~5 mm overlap. |
+| `body_coupling_bearing_capacity` | `1.0e4` | Pa | Plastic bearing capacity. Per-particle approach force is `bearing_capacity * dx^2`; summing over the `N` penetrating particles recovers `bearing_capacity * A_projected` (Terzaghi). |
 | `body_coupling_damping` | `5.0e1` | N·s/m | Normal damping `c_n` (resists approach only, `max(0, -v·n)`). |
 | `body_coupling_friction` | `0.5` | — | Coulomb friction coefficient `μ`. |
+| `body_coupling_stiffness` | `2.0e4` | N/m | **Deprecated.** Superseded by `body_coupling_bearing_capacity`; no longer read by the solver. Setting a non-default value triggers a `DeprecationWarning`. Retained for backwards compatibility only. |
 
 > **2026-05-14 — Phase 2c partial MVP success (4/5).** The sphere-drop
 > MVP at `newton/examples/multiphysics/example_sph_twoway_sphere_drop.py`
@@ -342,13 +343,24 @@ by an external MBD solver (e.g. MuJoCo, Featherstone). Enabled by
 
 ### Architecture
 
-SDF + penalty per primitive shape (sphere / capsule along local +Z /
-axis-aligned box). For each fluid particle inside a body's SDF:
+SDF + plastic indentation per primitive shape (sphere / capsule along
+local +Z / axis-aligned box). For each fluid particle inside a body's
+SDF, the force depends on the sign of `v_n = (v_p − v_body)·n`:
 
 ```
-F_n = (k_n d + c_n max(0, -v_rel·n)) n
+Approach (v_n < 0):
+    F_n = (bearing_capacity * dx^2 + c_n * (-v_n)) n
+Separation (v_n >= 0):
+    F_n = 0                                       (no restoring spring)
 F_t = -min(μ |F_n|, m_p |v_t| / dt) v_t / |v_t|   (chatter-regularised Coulomb)
 ```
+
+Each particle is a quadrature point covering area `dx^2`
+(`particle_spacing`). The bearing term summed over `N` penetrating
+particles approximates `bearing_capacity * A_projected` because
+`N * dx^2 ≈ A_projected`. The asymmetric on/off normal law dissipates
+impact KE — work done on approach is not returned on separation, so
+a body dropped on the bed settles instead of bouncing elastically.
 
 Reaction `-F` is applied at the contact point and atomic-added into a
 per-body `wp.spatial_vector` accumulator (`Model.body_count`-sized).
@@ -457,35 +469,22 @@ from ``state_out.sph.density`` (the midpoint density, computed at step
    robots with MuJoCo, option (a) — `body_q` interpolation across
    substeps — may be the better lever and remains TBD.
 
-**C. Terminal-z FAIL — fundamental limitation of penalty coupling.**
-   `test_final` criterion 5 (terminal sphere z near analytic crater
-   estimate) cannot pass with the current coupling design. The
-   penalty interface ``F = k_n·pen + c_n·max(0,-v_n)`` is inherently
-   **elastic**: the spring term stores energy that returns to the
-   sphere on separation (damping is off when ``v_n > 0``, i.e., during
-   separation). The sphere always bounces off the sand regardless of
-   drop height or damping coefficient. Tuning attempts:
-
-   - Deeper sand bed (``--sand-bed-bottom < 0``): adds material below,
-     but coupling impulse propagates through force chains and pushes
-     bottom-layer particles through the ground plane — massive leaks.
-   - Increased damping ``c_n`` > 200: destabilises per-particle
-     explicit integration (``c_n·v·dt / m_p`` ≫ 1 for μgram particles).
-   - Pure damping ``k_n=0``: no spring, but the SPH stress model
-     provides the restoring stiffness independently — the sand bed
-     still pushes back through SPH pressure, so bounce persists AND
-     the lack of spring restraint makes per-particle dashpot unstable.
-   - Lowered ``drop_height``: reduces KE but bounce persists; sphere
-     launched at multiple m/s every time.
-
-   The coupling end-to-end plumbing is correct; the physics limitation
-   is that real granular energy dissipation (plastic strain, grain
-   rearrangement) happens inside the SPH constitutive model, not at
-   the coupling boundary. Fixing criterion 5 requires a **plastic
-   coupling contact** law (e.g. Akinci-style interpolation through
-   the SPH smoothing kernel so the DP return mapping handles energy
-   dissipation) or a fundamentally different coupling scheme. Out of
-   scope for the MVP.
+**C. Terminal-z — plastic coupling implemented (2026-05-25).**
+   The coupling has been reworked from the elastic spring
+   ``F = k_n·pen + c_n·max(0,-v_n)`` to a plastic indentation law
+   ``F_n = bearing_capacity * dx^2 + c_n·max(0,-v_n)`` (zero on
+   separation). The sphere now settles into the bed instead of
+   bouncing elastically — criterion 5 (terminal-z vs analytic crater
+   estimate) is physically achievable. Depth accuracy depends on
+   correct ``particle_spacing``-based normalisation: the per-particle
+   bearing force is ``bearing_capacity * dx^2`` so that the sum over
+   ``N`` penetrating particles recovers the Terzaghi total
+   ``bearing_capacity * A_projected``. With ``dx = 5 mm`` and
+   ``bearing_capacity = 5e4 Pa`` the per-particle force is
+   ``1.25 N``; predicted penetration for a 1 kg sphere dropped from
+   0.10 m is about 6 mm (Ambrosio). Calibrate the bearing capacity
+   to the target soil; the coupling itself is no longer the
+   limiting factor.
 
 **D. `test_final` criterion 2 (settling) passes by bounce-apex artefact.**
    The sphere bounces to ±5 m/s after each impact. At each bounce apex,

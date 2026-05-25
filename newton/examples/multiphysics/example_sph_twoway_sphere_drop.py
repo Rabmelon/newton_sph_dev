@@ -4,21 +4,18 @@
 """SPH-rigid two-way coupling MVP: single sphere dropped into a sand bed.
 
 .. note::
-    **2026-05-14 — Partial MVP success (3/5 honest).** This example
-    passes 3 of 5 ``test_final`` criteria after Fix A (wrench reset)
-    and Fix B (MBD co-stepped at ``sim_dt``). Criterion 2 (settling)
-    passes by bounce-apex artefact — the sphere bounces at contact and
-    ``|vz|<0.05`` is caught at the apex of flight, not during true
-    settling. Criterion 5 (terminal-z vs analytic crater estimate)
-    cannot pass because the penalty coupling ``F = k_n·pen +
-    c_n·max(0,-v_n)`` is fundamentally **elastic**: the spring stores
-    energy that returns to the sphere on separation (damping is off
-    when ``v_n>0``). True granular energy dissipation happens inside
-    the SPH Drucker-Prager constitutive model, not at the coupling
-    boundary. A plastic-coupling scheme (e.g. Akinci-style kernel
-    interpolation) is required for criterion 5. See
-    ``newton/_src/solvers/sph/CLAUDE.md §10b`` for the full known-issues
-    list. The SPH baseline (``test_sph``, 14/14) is unaffected.
+    **2026-05-25 — Plastic coupling rework.** The coupling is now a
+    plastic indentation law: per-particle normal force
+    ``F_n = bearing_capacity * dx^2 + c_n * max(0, -v_n)``, zero on
+    separation. Summed across the ``N`` penetrating particles this
+    recovers the Terzaghi total ``bearing_capacity * A_projected``.
+    The work done on approach is **not** returned on separation, so
+    criterion 5 (terminal-z within ±20 % of the analytic crater
+    estimate) is now physically achievable with correct tuning of
+    ``body_coupling_bearing_capacity`` and ``particle_spacing``.
+    See ``newton/_src/solvers/sph/CLAUDE.md §10b`` for the current
+    known-issues list. The SPH baseline (``test_sph``, 14/14) is
+    unaffected.
 
 Drops a 1 kg, 5 cm-radius rigid sphere from 0.10 m above the surface
 into a 0.40 x 0.40 x 0.30 m static sand bed (dx = 5 mm) enclosed in a
@@ -211,7 +208,6 @@ class Example:
         sph_cfg.integration_scheme = args.integration_scheme
         # Body coupling
         sph_cfg.body_coupling_enabled = True
-        sph_cfg.body_coupling_stiffness = args.body_coupling_stiffness
         sph_cfg.body_coupling_damping = args.body_coupling_damping
         sph_cfg.body_coupling_friction = args.body_coupling_friction
         sph_cfg.body_coupling_bearing_capacity = args.body_coupling_bearing_capacity
@@ -675,7 +671,6 @@ class Example:
         )
 
         # Coupling
-        parser.add_argument("--body-coupling-stiffness", type=float, default=2.0e4)
         parser.add_argument("--body-coupling-damping", type=float, default=5.0e1)
         parser.add_argument("--body-coupling-friction", type=float, default=0.5)
         parser.add_argument("--body-coupling-bearing-capacity", type=float, default=1.0e4)
