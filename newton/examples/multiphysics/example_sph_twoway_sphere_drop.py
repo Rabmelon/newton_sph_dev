@@ -20,9 +20,10 @@
     ``newton/_src/solvers/sph/CLAUDE.md §10b`` for the full known-issues
     list. The SPH baseline (``test_sph``, 14/14) is unaffected.
 
-Drops a 1 kg, 5 cm-radius rigid sphere into a 0.20 x 0.20 x 0.10 m
-static sand bed (dx = 5 mm) and verifies the Phase 2b body-coupling
-hooks end-to-end before scaling up to articulated robots.
+Drops a 1 kg, 5 cm-radius rigid sphere from 0.10 m above the surface
+into a 0.40 x 0.40 x 0.30 m static sand bed (dx = 5 mm) enclosed in a
+0.40 x 0.40 x 0.40 m cubic penalty box (no top).  Verifies the Phase 2b
+body-coupling hooks end-to-end before scaling up to articulated robots.
 
 Architecture:
     * Single Newton :class:`Model` carrying both the SPH particles and
@@ -37,10 +38,11 @@ Architecture:
       ``ShapeFlags.COLLIDE_PARTICLES`` (set by default on every primitive
       via :class:`ModelBuilder.ShapeConfig`).
     * Per frame: SPH computes the sand-on-body wrench
-      (``solver.collect_body_wrench()``), the example low-passes it and
-      adds it to ``state.body_f``, then runs MBD ``step()`` followed by
-      SPH ``step()``.  Body pose is frozen across SPH substeps
-      (documented Phase 2b limitation).
+      (``solver.collect_body_wrench(state)``), the example converts it to
+      body forces via ``compute_body_forces`` and adds it to ``state.body_f``,
+      then runs MBD ``step()`` followed by SPH ``step()`` (which auto-resets
+      its internal wrench accumulator).  Matches the
+      ``example_mpm_twoway_coupling.py`` pattern.
     * Telemetry (per frame): sphere kinematics, sand wrench Fz, total
       kinetic energy, particle-leak counter — appended to
       ``args.log_path`` (CSV) at the end of the run.
@@ -77,6 +79,7 @@ from __future__ import annotations
 import math
 import os
 
+import matplotlib.pyplot as plt
 import numpy as np
 import warp as wp
 
@@ -87,31 +90,26 @@ from newton.solvers import SolverSemiImplicit, SolverSPH
 
 
 @wp.kernel
-def _add_body_wrench_kernel(
+def compute_body_forces(
     sand_wrench: wp.array[wp.spatial_vector],
-    alpha: float,
-    # in/out
-    wrench_lp: wp.array[wp.spatial_vector],
+    body_q: wp.array[wp.transform],
+    body_com: wp.array[wp.vec3],
     body_f: wp.array[wp.spatial_vector],
 ):
-    """First-order low-pass the sand wrench and add it to ``body_f``.
+    """Convert sand-on-body wrench to body forces at the center of mass.
 
-    ``wrench_lp = alpha * wrench_lp + (1 - alpha) * sand_wrench``, then
-    ``body_f += wrench_lp``.  Layout ``(linear, angular)`` matches Newton's
-    ``State.body_f`` convention, so the additions are element-wise.
+    Each entry of ``sand_wrench`` is already ``wp.spatial_vector(force_world,
+    torque_world)`` in [N, N*m] — the SPH coupling kernel computes the reaction
+    wrench directly.  We atomic-add into ``body_f`` so that the MBD solver
+    integrates it in the next step.
 
-    Args:
-        sand_wrench: Per-body sand-on-body wrench [N, N*m].
-        alpha: Low-pass coefficient in [0, 1]; higher = smoother.
-        wrench_lp: Persistent low-passed wrench [N, N*m].
-        body_f: Per-body force/torque accumulator [N, N*m].
+    Matches ``compute_body_forces`` in ``example_mpm_twoway_coupling.py``.
     """
     b = wp.tid()
-    w_new = sand_wrench[b]
-    w_lp_prev = wrench_lp[b]
-    w_lp_new = alpha * w_lp_prev + (1.0 - alpha) * w_new
-    wrench_lp[b] = w_lp_new
-    body_f[b] = body_f[b] + w_lp_new
+    w = sand_wrench[b]
+    # The wrench is already (force_world, torque_world) at the body COM from
+    # the SPH coupling kernel, so no lever-arm correction is needed here.
+    wp.atomic_add(body_f, b, w)
 
 
 class Example:
@@ -177,7 +175,21 @@ class Example:
         #    not rigid-on-plane contacts).
         builder.add_ground_plane(height=args.sand_bed_bottom, cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
 
-        # 4. Finalize and force Z-up gravity
+        # 4. Cubic box walls (no top): 0.40 x 0.40 x 0.40 m penalty boundaries.
+        #    Sand bed (0.40 x 0.40 x 0.30 m) sits inside.  Wall planes are
+        #    infinite in Z; floor clips particles from below.
+        half_box = 0.5 * args.sand_bed_size
+        wall_cfg = newton.ModelBuilder.ShapeConfig(mu=args.friction)
+        # Left wall: x = -half_box, normal +x
+        builder.add_shape_plane(plane=(1.0, 0.0, 0.0, half_box), width=0.4, length=0.4, cfg=wall_cfg)
+        # Right wall: x = +half_box, normal -x
+        builder.add_shape_plane(plane=(-1.0, 0.0, 0.0, half_box), width=0.4, length=0.4, cfg=wall_cfg)
+        # Front wall: y = -half_box, normal +y
+        builder.add_shape_plane(plane=(0.0, 1.0, 0.0, half_box), width=0.4, length=0.4, cfg=wall_cfg)
+        # Back wall: y = +half_box, normal -y
+        builder.add_shape_plane(plane=(0.0, -1.0, 0.0, half_box), width=0.4, length=0.4, cfg=wall_cfg)
+
+        # 5. Finalize and force Z-up gravity
         self.model = builder.finalize()
         self.model.set_gravity(tuple(args.gravity))
 
@@ -190,13 +202,19 @@ class Example:
         sph_cfg.artificial_viscosity_alpha = args.artificial_viscosity_alpha
         sph_cfg.sound_speed = args.sound_speed
         sph_cfg.penalty_stiffness = args.penalty_stiffness
+        sph_cfg.penalty_damping = 1.0e4
         sph_cfg.boundary_type = "penalty"
+        # Stable column base: high-friction floor, near-frictionless lateral walls.
+        # Wall vs floor split handled by solver's normal.z > 0.5 classifier.
+        sph_cfg.boundary_friction = 0.7
+        sph_cfg.boundary_wall_friction = 0.1
         sph_cfg.integration_scheme = args.integration_scheme
         # Body coupling
         sph_cfg.body_coupling_enabled = True
         sph_cfg.body_coupling_stiffness = args.body_coupling_stiffness
         sph_cfg.body_coupling_damping = args.body_coupling_damping
         sph_cfg.body_coupling_friction = args.body_coupling_friction
+        sph_cfg.body_coupling_bearing_capacity = args.body_coupling_bearing_capacity
 
         # Per-particle material parameters (sand defaults, mirrors granular example)
         for attr in ("young_modulus", "poisson_ratio", "friction", "cohesion", "viscosity"):
@@ -223,10 +241,6 @@ class Example:
         # Replicate body state into the ping-pong target so swap-in-place works.
         wp.copy(self.state_1.body_q, self.state_0.body_q)
         wp.copy(self.state_1.body_qd, self.state_0.body_qd)
-
-        # ---- Low-pass wrench buffer (first-order IIR per Phase 2b handoff) ----
-        self.wrench_lp = wp.zeros(self.model.body_count, dtype=wp.spatial_vector, device=self.model.device)
-        self.wrench_alpha = args.wrench_lowpass_alpha
 
         # ---- Viewer ----
         self.viewer.set_model(self.model)
@@ -310,6 +324,9 @@ class Example:
         sphere_vel = body_qd[0][:3]
         sphere_z = float(sphere_pos[2])
         sphere_vz = float(sphere_vel[2])
+        # Penetration depth: how far below the sand surface the sphere bottom sits.
+        sphere_bottom = sphere_z - self.args.sphere_radius
+        penetration_depth = max(0.0, self.args.sand_bed_top - sphere_bottom)
         # Numerical az from previous vz (frame-level finite difference).
         sphere_az = (sphere_vz - self._prev_sphere_vz) / self.frame_dt if self.sim_time > 0.0 else 0.0
         self._prev_sphere_vz = sphere_vz
@@ -339,6 +356,7 @@ class Example:
             "sand_wrench_force_z": wrench_fz,
             "total_kinetic_energy": ke_total,
             "n_particles_below_z0": n_leak,
+            "penetration_depth": penetration_depth,
         }
         self.telemetry.append(row)
         self._sphere_z_history.append(sphere_z)
@@ -352,6 +370,7 @@ class Example:
         "sand_wrench_force_z",
         "total_kinetic_energy",
         "n_particles_below_z0",
+        "penetration_depth",
     )
 
     def _open_telemetry_csv(self) -> None:
@@ -391,30 +410,29 @@ class Example:
     def step(self) -> None:
         """Advance one frame: MBD and SPH co-stepped at sim_dt inside one loop.
 
-        Fix B (option b1): MBD steps every SPH substep so the body pose
-        never jumps more than v * sim_dt between SPH evaluations. This
-        eliminates the slab-overlap impulse seen when MBD ran once per
-        outer frame and the sphere intruded ~10*dx in one go.
-
-        Wrench-accumulator semantics: reset and consume per substep.
-        Each substep order:
-            clear_forces -> add prev-substep wrench to body_f -> MBD step
-            -> sync body across ping-pong -> reset wrench acc -> SPH step.
+        Each substep: read the sand-on-body wrench from the previous SPH step
+        (stored on ``state._sph_body_wrench``), convert to body forces via
+        ``compute_body_forces``, step MBD, then step SPH.  The SPH solver
+        auto-resets its internal wrench accumulator each step, matching the
+        ``example_mpm_twoway_coupling.py`` pattern.
         """
         body_count = self.model.body_count
 
         for _ in range(self.sim_substeps):
-            # Per-substep frame: body_f starts zero, then takes wrench from
-            # last substep's SPH (low-passed by _add_body_wrench_kernel).
+            # Body forces start zero; add sand wrench from previous substep.
             self.state_0.clear_forces()
 
-            sand_wrench = self.sph_solver.collect_body_wrench()
+            sand_wrench = self.sph_solver.collect_body_wrench(self.state_0)
             if sand_wrench is not None:
                 wp.launch(
-                    _add_body_wrench_kernel,
+                    compute_body_forces,
                     dim=body_count,
-                    inputs=[sand_wrench, self.wrench_alpha],
-                    outputs=[self.wrench_lp, self.state_0.body_f],
+                    inputs=[
+                        sand_wrench,
+                        self.state_0.body_q,
+                        self.model.body_com,
+                    ],
+                    outputs=[self.state_0.body_f],
                     device=self.model.device,
                 )
 
@@ -435,19 +453,18 @@ class Example:
                 self.state_0.body_q = wp.array(body_q_np, dtype=wp.transform, device=self.model.device)
                 self.state_0.body_qd.zero_()
 
-            # Mirror body state into state_1 so the SPH step's post-swap
-            # output state carries the freshly integrated body kinematics.
+            # Mirror body state into state_1 so the SPH step's output state
+            # carries the freshly integrated body kinematics.
             wp.copy(self.state_1.body_q, self.state_0.body_q)
             wp.copy(self.state_1.body_qd, self.state_0.body_qd)
 
-            # Fresh wrench accumulator: SPH atomic-adds into it this substep
-            # only; next iteration consumes and overwrites via low-pass.
-            self.sph_solver.reset_wrench_accumulator()
+            # SPH step: auto-zeros internal wrench accumulator, recomputes
+            # from scratch, and stores result on state_out._sph_body_wrench.
             self.sph_solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
         # One host sync per frame for telemetry (last substep's wrench).
-        last_wrench = self.sph_solver.collect_body_wrench()
+        last_wrench = self.sph_solver.collect_body_wrench(self.state_0)
         sand_wrench_np = last_wrench.numpy() if last_wrench is not None else None
 
         self.sim_time += self.frame_dt
@@ -456,8 +473,12 @@ class Example:
         if self._settle_steps_remaining > 0:
             self._settle_steps_remaining -= 1
 
-        if self.sim_time >= self.sim_duration and hasattr(self.viewer, "should_close"):
-            self.viewer.should_close = True
+        if self.sim_time >= self.sim_duration:
+            if not getattr(self, "_plot_generated", False):
+                self._plot_generated = True
+                self.plot_penetration_depth(save_path=getattr(self.args, "plot_path", None))
+            if hasattr(self.viewer, "should_close"):
+                self.viewer.should_close = True
 
     # ------------------------------------------------------------------
     # Viewer
@@ -478,6 +499,28 @@ class Example:
     # ------------------------------------------------------------------
     # Tests
     # ------------------------------------------------------------------
+
+    def plot_penetration_depth(self, save_path: str | None = None) -> None:
+        """Plot sphere penetration depth into the sand surface vs time."""
+        times = [r["t"] for r in self.telemetry]
+        depths_mm = [r.get("penetration_depth", 0.0) * 1000.0 for r in self.telemetry]
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(times, depths_mm, color="steelblue", linewidth=1.5)
+        ax.set_xlabel("Time [s]")
+        ax.set_ylabel("Penetration depth [mm]")
+        ax.set_title("Sphere penetration into granular column surface")
+        ax.set_xlim(left=0.0)
+        ax.set_ylim(bottom=0.0)
+        ax.grid(True, alpha=0.4)
+        fig.tight_layout()
+
+        if save_path:
+            fig.savefig(save_path, dpi=150)
+            print(f"[sphere_drop] penetration plot saved: {save_path}", flush=True)
+        else:
+            plt.show()
+        plt.close(fig)
 
     def _predict_penetration(self) -> float:
         """Newtonian crater-scaling estimate of final sphere bottom-z [m].
@@ -508,6 +551,9 @@ class Example:
         # the log even on failure (rows are append-flushed each frame, this
         # is the close-on-clean-exit hook).
         self._close_telemetry_csv()
+        # Plot already generated at end of simulation loop (step()); skip if already done.
+        if not getattr(self, "_plot_generated", False):
+            self.plot_penetration_depth(save_path=getattr(self.args, "plot_path", None))
 
         if not self.telemetry:
             raise ValueError("No telemetry collected -- did the simulation run?")
@@ -592,8 +638,8 @@ class Example:
         # seconds on a single GPU.  The Phase 2b plan calls for 40 x 40 x 15 cm;
         # bump --sand-bed-size to 0.40 and --sand-bed-top to 0.15 for the full
         # validation run.
-        parser.add_argument("--sand-bed-size", type=float, default=0.20, help="Sand bed X and Y extent [m].")
-        parser.add_argument("--sand-bed-top", type=float, default=0.10, help="Sand bed surface z (top) [m].")
+        parser.add_argument("--sand-bed-size", type=float, default=0.40, help="Sand bed X and Y extent [m].")
+        parser.add_argument("--sand-bed-top", type=float, default=0.30, help="Sand bed surface z (top) [m].")
         parser.add_argument(
             "--sand-bed-bottom",
             type=float,
@@ -609,7 +655,7 @@ class Example:
             "--integration-scheme", type=str, default="position_verlet", choices=["symplectic_euler", "position_verlet"]
         )
         parser.add_argument("--artificial-viscosity-alpha", type=float, default=0.1)
-        parser.add_argument("--penalty-stiffness", type=float, default=1.0e6)
+        parser.add_argument("--penalty-stiffness", type=float, default=1.0e8)
 
         # Material (sand DP defaults match newton.examples.sph_granular)
         parser.add_argument("--young-modulus", type=float, default=1.0e6)
@@ -624,7 +670,7 @@ class Example:
         parser.add_argument(
             "--drop-height",
             type=float,
-            default=0.30,
+            default=0.10,
             help="Sphere bottom-of-sphere starting height above sand surface [m].",
         )
 
@@ -632,20 +678,23 @@ class Example:
         parser.add_argument("--body-coupling-stiffness", type=float, default=2.0e4)
         parser.add_argument("--body-coupling-damping", type=float, default=5.0e1)
         parser.add_argument("--body-coupling-friction", type=float, default=0.5)
-        parser.add_argument(
-            "--wrench-lowpass-alpha",
-            type=float,
-            default=0.3,
-            help="First-order low-pass coefficient for the sand wrench (0=off).",
-        )
-
+        parser.add_argument("--body-coupling-bearing-capacity", type=float, default=1.0e4)
         # Other simulation knobs
         parser.add_argument("--gravity", type=float, nargs=3, default=[0.0, 0.0, -9.81])
         parser.add_argument("--fps", type=float, default=50.0)
         parser.add_argument("--substeps", type=int, default=None, help="SPH substeps per frame.  Default: CFL-derived.")
         parser.add_argument("--duration", type=float, default=0.8, help="Simulation duration [s].")
         parser.add_argument(
-            "--settle-time", type=float, default=0.0, help="Pre-settle interval [s] (sphere kinematically frozen)."
+            "--settle-time",
+            type=float,
+            default=0.05,
+            help="Pre-settle interval [s] (sphere frozen, sand settles). Default 0.05 s.",
+        )
+        parser.add_argument(
+            "--plot-path",
+            type=str,
+            default=None,
+            help="Path to save penetration-depth time-curve PNG. If omitted, figure is shown interactively.",
         )
         parser.add_argument(
             "--bearing-capacity", type=float, default=1.0e4, help="sigma_y for analytical penetration depth [Pa]."

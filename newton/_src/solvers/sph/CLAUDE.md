@@ -358,22 +358,29 @@ angular. The caller integrates the accumulator into `State.body_f`
 before the MBD step (see `newton/examples/mpm/example_mpm_twoway_coupling.py`
 for the wire-up pattern; the SPH example lives elsewhere — Phase 2c).
 
-The accumulator is exposed via `SolverSPH.collect_body_wrench() ->
-wp.array[wp.spatial_vector] | None`. **Reset is explicit (2026-05-14):
-`SolverSPH.step()` is pure-accumulate; the caller must invoke
-`SolverSPH.reset_wrench_accumulator()` to zero the buffer.** Since
-`step()` is one substep and the caller drives the substep loop, the
-chosen reset cadence determines what `collect_body_wrench()` reads:
+The accumulator is exposed via ``SolverSPH.collect_body_wrench(state) ->
+wp.array[wp.spatial_vector] | None`` (matching MPM's
+``collect_collider_impulses(state)`` signature). **Reset is automatic:**
+``_apply_body_forces`` zeros the internal accumulator at the start of
+each call, and the result is stored on ``state_out._sph_body_wrench``
+at the end of each step path. The caller reads the wrench from the
+output state after each ``step()`` returns::
 
-- **Per outer frame** (integrated impulse pattern): reset once before
-  the substep loop, loop `step()` N times, then `collect_body_wrench()`
-  returns the impulse integrated across all N substeps.
-- **Per substep** (instantaneous reaction pattern, used by the
-  sphere-drop example when MBD co-steps inside the SPH substep loop):
-  reset before each `step()` call so the next iteration consumes only
-  the latest substep's contribution. See
-  `newton/examples/multiphysics/example_sph_twoway_sphere_drop.py:step`
-  for the per-substep wire-up.
+    for _ in range(substeps):
+        # Apply previous substep's sand wrench to body_f
+        wrench = solver.collect_body_wrench(state_0)
+        if wrench is not None:
+            compute_body_forces(wrench, body_q, body_com, state_0.body_f)
+        # MBD step
+        mbd_solver.step(state_0, state_1, ...)
+        # SPH step (auto-resets and re-accumulates wrench internally)
+        sph_solver.step(state_0, state_1, ...)
+        state_0, state_1 = state_1, state_0
+
+The glue kernel ``compute_body_forces`` (in the example) converts the
+wrench to body forces — see
+``newton/examples/mpm/example_mpm_twoway_coupling.py`` for the reference
+pattern.
 
 ### Collider table
 
@@ -414,8 +421,8 @@ Shape parameter packing (from `model.shape_scale`):
    bounces off the granular material. A plastic coupling scheme
    (e.g. Akinci-style kernel interpolation where the DP return
    mapping dissipates energy) is needed for true settling. MVP callers
-   should low-pass the wrench and expect bounce dynamics; the current
-   sphere-drop example logs these bounces in telemetry.
+   should expect bounce dynamics; the current sphere-drop example logs
+   these bounces in telemetry.
 5. **Z-up assumption** — `_init_body_coupling` raises `ValueError` if
    `model.up_axis != Axis.Z` (the SPH solver's geostatic init and
    ground-plane extraction both assume Z-up).
@@ -423,20 +430,21 @@ Shape parameter packing (from `model.shape_scale`):
 ### Hooks in `SolverSPH.step()`
 
 After `_apply_boundary_forces`, before `_integrate`, both step paths
-launch `_apply_body_forces(...)`. The Verlet path passes `pos =
-self._pos_mid` and `vel = state_in.particle_qd` and reads density
-from `state_out.sph.density` (the midpoint density, computed at step
-3 of `_step_position_verlet`).
+launch `_apply_body_forces(...)` which zeros the internal accumulator,
+launches the coupling kernel, and then stores the result on
+``state_out._sph_body_wrench``. The Verlet path passes ``pos =
+self._pos_mid`` and ``vel = state_in.particle_qd`` and reads density
+from ``state_out.sph.density`` (the midpoint density, computed at step
+3 of ``_step_position_verlet``).
 
 ### Known issues (2026-05-14)
 
-**A. Wrench reset semantics — FIXED (2026-05-14).** `SolverSPH.step()`
-   no longer zeros `_body_f_sand`; a new public method
-   `SolverSPH.reset_wrench_accumulator()` is the explicit reset hook.
-   Callers choose the reset cadence (per outer frame for integrated
-   impulse, per substep for instantaneous reaction). See the reset
-   contract paragraph above and the sphere-drop example for the
-   per-substep pattern.
+**A. Wrench reset semantics — FIXED (2026-05-14, refactored 2026-05-17).**
+   ``_apply_body_forces`` zeros ``_body_f_sand`` at the start of each call
+   and the result is stored on ``state_out._sph_body_wrench`` at the end
+   of each step path.  ``collect_body_wrench(state)`` reads from state
+   (matching MPM's ``collect_collider_impulses(state)``).  The explicit
+   ``reset_wrench_accumulator()`` method has been removed.
 
 **B. Body pose frozen across substep loop — FIXED (2026-05-14) in the
    sphere-drop example via option (b)**: MBD runs at `sim_dt` inside

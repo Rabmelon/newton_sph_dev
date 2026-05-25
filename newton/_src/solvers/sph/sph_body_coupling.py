@@ -8,12 +8,20 @@ Architecture: SDF + penalty per primitive collision shape
 inside a body collider:
 
     F_n = (k_n * d + c_n * max(0, -v_rel . n)) * n     (normal penalty + damping)
-    F_t = -min(mu * |F_n|, k_n * m * |v_t| * dt_scale) * v_t / |v_t|   (Coulomb)
+    F_t = -min(mu * |F_n|, m_p * |v_t| / dt) * v_t / |v_t|   (Coulomb)
 
-Reaction wrench `-F` is applied at the contact point and atomic-added into a
+Reaction wrench ``-F`` is applied at the contact point and atomic-added into a
 per-body :class:`wp.spatial_vector` accumulator (layout ``(linear, angular)``
 to match Newton's :attr:`State.body_f` convention). The caller integrates the
 accumulator into :attr:`State.body_f` before the MBD step.
+
+.. note::
+    The penalty coupling is fundamentally **elastic** — the spring stores energy
+    that returns to the body on separation (damping only resists approach,
+    ``c_n * max(0, -v_n)``). A plastic coupling scheme (e.g. Akinci-style
+    kernel interpolation through the SPH smoothing kernel, so the DP return
+    mapping handles dissipation) is required for true settling. See
+    ``newton/_src/solvers/sph/CLAUDE.md §10b`` for the full known-issues list.
 
 References:
     - Newton MPM ``compute_body_forces`` (``newton.examples.mpm.example_mpm_twoway_coupling``)
@@ -33,6 +41,7 @@ from .sph_dummy_boundary import SPH_FLUID
 wp.set_module_options({"enable_backward": False})
 
 _EPSILON = wp.constant(1.0e-8)
+_PI = wp.constant(3.141592653589793)
 
 # Collider shape-type tag values used by the Warp kernel. Kept as a small dense
 # enum (not :class:`GeoType` directly) so the kernel branches stay tight and so
@@ -146,6 +155,26 @@ def _body_sdf_3d(shape_type: int, params: wp.vec3, x_local: wp.vec3):
     return _sdf_box_3d(x_local, params)
 
 
+@wp.func
+def _plastic_contact_area(shape_type: int, params: wp.vec3, pen: float) -> float:
+    """Projected contact area [m^2] for a shape at penetration depth ``pen``.
+
+    Sphere: spherical cap projected area, saturating at full cross-section.
+    Capsule / box: characteristic cross-section (order-of-magnitude estimate).
+    """
+    if shape_type == _SHAPE_SPHERE:
+        r = params[0]
+        a_sq = wp.where(pen < r, 2.0 * r * pen - pen * pen, r * r)
+        a_sq = wp.max(a_sq, 0.0)
+        return _PI * a_sq
+    # Non-sphere shapes: use full cross-section as a constant-area
+    # approximation (capsule & box coupling is not validated yet).
+    if shape_type == _SHAPE_CAPSULE:
+        return _PI * params[0] * params[0]
+    # Box
+    return 4.0 * params[0] * params[1]
+
+
 @wp.kernel
 def apply_body_coupling_force_kernel(
     # particle inputs
@@ -169,6 +198,7 @@ def apply_body_coupling_force_kernel(
     k_n: float,
     c_n: float,
     mu: float,
+    bearing_capacity: float,
     inv_mass_scale_dt: float,
     # outputs (accumulated)
     accel: wp.array[wp.vec3],
@@ -182,8 +212,7 @@ def apply_body_coupling_force_kernel(
     wrench is atomic-added to ``body_f_sand`` at the body's COM, expressed as
     ``wp.spatial_vector(force_world, torque_world)``.
 
-    Body pose is frozen during the SPH substep loop -- interpolation is TBD
-    (Phase 2c).
+    Body pose is frozen during the SPH substep loop.
 
     Args:
         particle_q: Particle positions [m].
@@ -204,6 +233,8 @@ def apply_body_coupling_force_kernel(
         k_n: Normal penalty stiffness [N/m].
         c_n: Normal damping [N*s/m].
         mu: Coulomb friction coefficient.
+        bearing_capacity: Reserved for future plastic coupling (currently
+            unused by the elastic penalty model).
         inv_mass_scale_dt: Tangential damping regularization scale (``1/dt``-style
             term) [1/s], used to cap friction at low slip velocities to avoid
             stick-slip chatter; see :meth:`SolverSPH._apply_body_forces`.
@@ -256,7 +287,9 @@ def apply_body_coupling_force_kernel(
 
         # Penetration depth (>= 0), force magnitudes in [N].
         pen = -d
-        # Damping only resists approach (v_n < 0); avoid sticky pull-out.
+
+        # Elastic coupling with approach-only damping.
+        # Damping only resists approach (v_n < 0); avoids sticky pull-out.
         f_n_mag = k_n * pen + c_n * wp.max(0.0, -v_n)
         if f_n_mag < 0.0:
             f_n_mag = 0.0

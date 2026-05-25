@@ -34,7 +34,7 @@ def ground_plane_penalty_kernel(
     plane_offset: float,
     ke: float,
     kd: float,
-    mu_f: float,
+    friction: float,
     # output (accumulated)
     accel: wp.array[wp.vec3],
 ):
@@ -61,7 +61,7 @@ def ground_plane_penalty_kernel(
         plane_offset: Plane offset (d in ax + by + cz + d = 0).
         ke: Penalty stiffness [N/m per unit mass -> m/s^2 per m penetration].
         kd: Penalty damping [N*s/m per unit mass].
-        mu_f: Coulomb friction coefficient.
+        friction: Coulomb friction coefficient for this plane.
         accel: Acceleration array (accumulated in-place).
     """
     i = wp.tid()
@@ -85,11 +85,11 @@ def ground_plane_penalty_kernel(
         accel[i] = accel[i] + f_mag * plane_normal
 
         # Coulomb tangential friction
-        if mu_f > 0.0:
+        if friction > 0.0:
             v_t = v - wp.dot(v, plane_normal) * plane_normal
             v_t_norm = wp.length(v_t)
             if v_t_norm > _EPSILON:
-                f_t_mag = mu_f * f_mag
+                f_t_mag = friction * f_mag
                 # Regularization: cap by damping-like term to avoid chatter
                 f_t_mag = wp.min(f_t_mag, kd * v_t_norm)
                 accel[i] = accel[i] - (f_t_mag / wp.max(v_t_norm, _EPSILON)) * v_t
