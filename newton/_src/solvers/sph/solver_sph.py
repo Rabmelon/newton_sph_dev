@@ -126,31 +126,10 @@ class SolverSPH(SolverBase):
         # --- Two-way coupling with rigid bodies (MBD) ---
         body_coupling_enabled: bool = False
         """Enable SDF + penalty coupling against shapes flagged ``ShapeFlags.COLLIDE_PARTICLES``."""
-        body_coupling_stiffness: float = 2.0e4
-        """Normal penalty stiffness for body coupling [N/m].
-
-        .. note::
-            Superseded by :attr:`body_coupling_bearing_capacity` since the
-            coupling now uses a plastic indentation law instead of an
-            elastic spring; this field is retained for backwards compatibility
-            with existing examples and is no longer read by the solver.
-        """
-        body_coupling_damping: float = 5.0e1
+        body_coupling_damping: float = 1.0
         """Normal damping for body coupling [N*s/m]."""
         body_coupling_friction: float = 0.5
         """Coulomb friction coefficient between fluid particles and body colliders."""
-        body_coupling_bearing_capacity: float = 1.0e4
-        """Plastic bearing capacity of the granular material [Pa].
-
-        The normal contact force during approach is
-        ``bearing_capacity * A_contact(pen)`` plus a rate-dependent damping
-        term.  During separation the force is zero — the sand does not
-        pull the body back.  Typical values:
-
-        - Loose sand:     5e3-1e4 Pa
-        - Medium-dense sand: 1e4-5e4 Pa
-        - Dense sand:     5e4-2e5 Pa
-        """
 
         def __post_init__(self) -> None:
             supported_simulation_methods = {"dp", "mui"}
@@ -169,14 +148,6 @@ class SolverSPH(SolverBase):
             if self.boundary_type not in supported_boundary_types:
                 raise ValueError(
                     f"Invalid boundary_type: {self.boundary_type}. Must be one of {supported_boundary_types}."
-                )
-            if self.body_coupling_stiffness != 2.0e4:
-                warnings.warn(
-                    "body_coupling_stiffness is superseded by body_coupling_bearing_capacity "
-                    "and is no longer read by the solver. Update your code to use "
-                    "body_coupling_bearing_capacity instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
                 )
 
     @classmethod
@@ -411,47 +382,6 @@ class SolverSPH(SolverBase):
             self._body_f_sand = wp.zeros(body_count, dtype=wp.spatial_vector, device=self.model.device)
         else:
             self._body_f_sand = None
-        self._check_penalty_cfl()
-
-    def _check_penalty_cfl(self) -> None:
-        """Warn if the body-coupling effective stiffness exceeds the explicit-Euler
-        stability bound.
-
-        The plastic coupling effective stiffness is
-        ``k_eff = bearing_capacity * dA/d(pen) ~= bearing_capacity * 2*pi*R``
-        (spherical contact, small penetration).  The 1-DOF spring-mass bound
-        ``k * dt^2 / m < 4`` is used with the static acoustic CFL ``dt`` and
-        the minimum particle mass.  The characteristic radius is picked
-        from the actual body-collider table (max first-component of
-        ``shape_params``), falling back to 0.05 m if no collider exists.
-        """
-        if not self._config.body_coupling_enabled:
-            return
-        if self.model.particle_count == 0:
-            return
-        m_np = self.model.particle_mass.numpy()
-        m_min = float(m_np.min()) if m_np.size else 0.0
-        if m_min <= 0.0:
-            return
-        dt = self._dt_cfl_static
-        # Characteristic radius / half-extent from the collider table — read
-        # once at init, not in the hot path. For a sphere this is r; for a
-        # capsule it is r; for a box it is the x half-extent. The pick is
-        # the conservative max across all colliders.
-        r_char = 0.05  # fallback [m]
-        if self._body_collider is not None and len(self._body_collider.shape_params) > 0:
-            r_char = float(max(p[0] for p in self._body_collider.shape_params.numpy()))
-        k_eff = self._config.body_coupling_bearing_capacity * 2.0 * 3.141592653589793 * r_char
-        ratio = k_eff * dt * dt / m_min
-        if ratio > 4.0:
-            warnings.warn(
-                f"SPH body coupling effective stiffness k_eff={k_eff:.3e} N/m "
-                f"with dt_cfl={dt:.3e} s and m_p_min={m_min:.3e} kg gives k*dt^2/m={ratio:.2f}, "
-                "exceeding the explicit-Euler stability bound of 4. "
-                "Reduce body_coupling_bearing_capacity, the substep, or increase particle mass.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
 
     @property
     def config(self) -> Config:
@@ -977,8 +907,6 @@ class SolverSPH(SolverBase):
         self._body_f_sand.zero_()
         positions = pos if pos is not None else state.particle_q
         velocities = vel if vel is not None else state.particle_qd
-        # Use 1/dt as the chatter regularization scale for tangential friction.
-        inv_dt = 1.0 / dt if dt > 0.0 else 0.0
         wp.launch(
             apply_body_coupling_force_kernel,
             dim=self.model.particle_count,
@@ -989,6 +917,7 @@ class SolverSPH(SolverBase):
                 self._particle_type,
                 state.sph.density,
                 self.model.particle_mass,
+                state.sph.pressure,
                 state.body_q,
                 state.body_qd,
                 self.model.body_com,
@@ -999,9 +928,7 @@ class SolverSPH(SolverBase):
                 collider.count,
                 self._config.body_coupling_damping,
                 self._config.body_coupling_friction,
-                self._config.body_coupling_bearing_capacity,
                 self._config.particle_spacing,
-                inv_dt,
             ],
             outputs=[self._accel, self._body_f_sand],
             device=self.model.device,

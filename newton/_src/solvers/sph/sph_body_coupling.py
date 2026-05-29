@@ -3,26 +3,27 @@
 
 """Two-way coupling between SolverSPH and rigid bodies driven by an MBD solver.
 
-Architecture: SDF + plastic indentation per primitive collision shape
+Architecture: SDF + Akinci-style pressure coupling per primitive collision shape
 (sphere / capsule along local Z / axis-aligned box). For each fluid particle
-inside a body collider, the normal force depends on the sign of the relative
-normal velocity ``v_n = (v_p - v_body_at_x) . n``:
+inside a body collider, the normal force depends on the SPH pressure at that
+particle and the sign of the relative normal velocity
+``v_n = (v_p - v_body_at_x) . n``:
 
     Approach (v_n < 0):
-        F_n = (bearing_capacity * dx^2 + c_n * (-v_n)) * n
+        F_n = (max(P_i, 0) * dx^2 + c_n * (-v_n)) * n
     Separation (v_n >= 0):
         F_n = 0     (no restoring spring — sand does not pull the body back)
 
-    F_t = -min(mu * |F_n|, m_p * |v_t| / dt) * v_t / |v_t|   (Coulomb, regularised)
+    F_t = -mu * |F_n| * v_t / sqrt(|v_t|^2 + V_EPS^2)   (smooth Coulomb, V_EPS = 1 mm/s)
 
-Each SPH particle acts as a quadrature point covering area ``dx^2``
-(``dx`` = ``particle_spacing``). Summing the per-particle bearing force
-``bearing_capacity * dx^2`` over the ``N`` particles inside the SDF
-recovers the Terzaghi total ``bearing_capacity * A_projected`` because
-``N * dx^2`` approximates the projected contact area. The asymmetric on/off
-law dissipates impact kinetic energy: work done by the contact during
-approach is **not** returned during separation, so a body dropped on the
-granular bed settles instead of bouncing elastically.
+``P_i`` is the Shepard-corrected SPH pressure (``State.sph.pressure``, Pa,
+positive in compression) at the penetrating fluid particle. Each SPH particle
+acts as a quadrature point covering area ``dx^2`` (``dx`` = ``particle_spacing``),
+so summing the per-particle repulsion ``P_i * dx^2`` over all penetrating
+particles integrates the SPH pressure field over the contact surface — the
+plasticity and yield behaviour come from the granular constitutive law (Drucker-
+Prager) rather than from a tuned bearing-capacity knob. The asymmetric on/off
+law prevents elastic energy return on separation.
 
 Reaction wrench ``-F`` is applied at the contact point and atomic-added into a
 per-body :class:`wp.spatial_vector` accumulator (layout ``(linear, angular)``
@@ -31,7 +32,7 @@ accumulator into :attr:`State.body_f` before the MBD step.
 
 References:
     - Newton MPM ``compute_body_forces`` (``newton.examples.mpm.example_mpm_twoway_coupling``)
-    - tiSPHi penalty boundary
+    - Akinci et al. 2012, "Versatile Rigid-Fluid Coupling for Incompressible SPH"
 """
 
 from __future__ import annotations
@@ -48,6 +49,9 @@ wp.set_module_options({"enable_backward": False})
 
 _EPSILON = wp.constant(1.0e-8)
 _PI = wp.constant(3.141592653589793)
+# Slip-velocity smoothing for Coulomb friction: below this threshold the
+# tangential direction is ill-conditioned; above it kinetic friction is exact.
+_V_EPS = wp.constant(1.0e-3)
 
 # Collider shape-type tag values used by the Warp kernel. Kept as a small dense
 # enum (not :class:`GeoType` directly) so the kernel branches stay tight and so
@@ -161,33 +165,6 @@ def _body_sdf_3d(shape_type: int, params: wp.vec3, x_local: wp.vec3):
     return _sdf_box_3d(x_local, params)
 
 
-@wp.func
-def _plastic_contact_area(shape_type: int, params: wp.vec3, pen: float) -> float:
-    """Projected contact area [m^2] for a shape at penetration depth ``pen``.
-
-    Sphere: spherical cap projected area, saturating at full cross-section.
-    Capsule / box: characteristic cross-section (order-of-magnitude estimate).
-
-    .. note::
-        Not called by :func:`apply_body_coupling_force_kernel` — that kernel
-        uses the per-particle quadrature area ``dx^2`` so that the sum over
-        all penetrating particles recovers the projected contact area
-        automatically. Kept as a utility for CFL estimation and future
-        kernels that need an explicit per-shape contact area.
-    """
-    if shape_type == _SHAPE_SPHERE:
-        r = params[0]
-        a_sq = wp.where(pen < r, 2.0 * r * pen - pen * pen, r * r)
-        a_sq = wp.max(a_sq, 0.0)
-        return _PI * a_sq
-    # Non-sphere shapes: use full cross-section as a constant-area
-    # approximation (capsule & box coupling is not validated yet).
-    if shape_type == _SHAPE_CAPSULE:
-        return _PI * params[0] * params[0]
-    # Box
-    return 4.0 * params[0] * params[1]
-
-
 @wp.kernel
 def apply_body_coupling_force_kernel(
     # particle inputs
@@ -197,6 +174,7 @@ def apply_body_coupling_force_kernel(
     particle_type: wp.array[wp.int32],
     particle_density: wp.array[float],
     particle_mass: wp.array[float],
+    particle_pressure: wp.array[float],
     # body inputs
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
@@ -210,28 +188,25 @@ def apply_body_coupling_force_kernel(
     # coupling params
     c_n: float,
     mu: float,
-    bearing_capacity: float,
     particle_spacing: float,
-    inv_mass_scale_dt: float,
     # outputs (accumulated)
     accel: wp.array[wp.vec3],
     body_f_sand: wp.array[wp.spatial_vector],
 ):
-    """Apply plastic coupling + Coulomb friction forces between SPH fluids and rigid bodies.
+    """Apply Akinci-style SPH-pressure coupling + Coulomb friction between SPH fluids and rigid bodies.
 
-    For each fluid particle, query every collider, evaluate the analytic SDF
-    in shape-local frame, and if penetrating, apply a plastic indentation
-    force during approach (zero on separation) and a Coulomb tangential
-    friction force. The equal-and-opposite wrench is atomic-added to
-    ``body_f_sand`` at the body's COM, expressed as
-    ``wp.spatial_vector(force_world, torque_world)``.
+    For each fluid particle inside a body's SDF, the normal repulsion force is
+    driven by the SPH pressure at that particle (``State.sph.pressure``, Pa,
+    positive in compression). Summing ``P_i * dx^2`` over penetrating particles
+    integrates the pressure field over the contact surface; plasticity and yield
+    come from the granular constitutive model (Drucker-Prager), not a tuned knob.
 
-    The normal force is ``bearing_capacity * dx^2 + c_n * (-v_n)`` per
-    particle while ``v_n < 0`` (body approaching the particle), and zero
-    during separation. Summing the bearing term over the ``N`` penetrating
-    particles recovers the Terzaghi total
-    ``bearing_capacity * A_projected`` since ``N * dx^2`` approximates the
-    projected contact area. Body pose is frozen during the SPH substep loop.
+    Normal force while ``v_n < 0`` (approach): ``(max(P_i, 0) * dx^2 + c_n * (-v_n)) * n``.
+    Zero on separation — sand does not pull the body back. Body pose is frozen
+    during the SPH substep loop.
+
+    The equal-and-opposite wrench is atomic-added to ``body_f_sand`` at the
+    body's COM as ``wp.spatial_vector(force_world, torque_world)``.
 
     Args:
         particle_q: Particle positions [m].
@@ -241,6 +216,9 @@ def apply_body_coupling_force_kernel(
         particle_density: Per-particle density [kg/m^3]; particles with
             non-positive or non-finite density are skipped.
         particle_mass: Per-particle mass [kg].
+        particle_pressure: Per-particle SPH pressure [Pa], positive in compression
+            (``State.sph.pressure``). Only the compressive part (``max(P, 0)``)
+            contributes to the normal repulsion.
         body_q: Body transforms (world).
         body_qd: Body twists (linear, angular) in world frame.
         body_com: Body COM offsets [m] in body-local frame.
@@ -251,14 +229,8 @@ def apply_body_coupling_force_kernel(
         n_colliders: Number of collider entries.
         c_n: Normal damping [N*s/m], active only during approach.
         mu: Coulomb friction coefficient.
-        bearing_capacity: Plastic bearing capacity of the granular material
-            [Pa]. The approach-phase normal force per particle is
-            ``bearing_capacity * dx^2`` plus the damping term.
         particle_spacing: SPH particle spacing ``dx`` [m]; each particle is
             treated as a quadrature point covering area ``dx^2``.
-        inv_mass_scale_dt: Tangential damping regularization scale (``1/dt``-style
-            term) [1/s], used to cap friction at low slip velocities to avoid
-            stick-slip chatter; see :meth:`SolverSPH._apply_body_forces`.
         accel: Particle acceleration accumulator [m/s^2].
         body_f_sand: Per-body sand-on-body wrench accumulator [N, N*m],
             layout ``(force_world, torque_world)``.
@@ -306,25 +278,26 @@ def apply_body_coupling_force_kernel(
         v_n = wp.dot(v_rel, n_w)
         v_t = v_rel - v_n * n_w
 
-        # Plastic coupling: no restoring force on separation.
-        # Approach: bearing pressure * per-particle quadrature area + rate damping.
-        # Each particle covers dx^2, so summing over N penetrating particles
-        # yields bearing_capacity * N * dx^2 ~= bearing_capacity * A_projected
-        # (Terzaghi). Separation: zero force — no energy returned to body.
+        # Akinci-style coupling: no restoring force on separation.
+        # Approach: SPH pressure at penetrating particle * per-particle quadrature
+        # area + rate damping. Summing P_i * dx^2 integrates the SPH pressure field
+        # over the contact surface; plasticity comes from the granular DP model.
+        # Separation: zero force — no energy returned to body.
         if v_n >= 0.0:
             continue
         particle_area = particle_spacing * particle_spacing
-        f_n_mag = bearing_capacity * particle_area + c_n * (-v_n)
+        p_repel = wp.max(particle_pressure[pid], 0.0)
+        f_n_mag = p_repel * particle_area + c_n * (-v_n)
         if f_n_mag <= 0.0:
             continue
         f_n = f_n_mag * n_w
 
         # Coulomb friction, regularized by a damping-like cap to avoid chatter.
         f_t = wp.vec3(0.0)
-        v_t_norm = wp.length(v_t)
-        if mu > 0.0 and v_t_norm > _EPSILON:
-            f_t_mag = wp.min(mu * f_n_mag, m_p * v_t_norm * inv_mass_scale_dt)
-            f_t = -(f_t_mag / wp.max(v_t_norm, _EPSILON)) * v_t
+        if mu > 0.0:
+            v_t_norm = wp.length(v_t)
+            v_eff = wp.sqrt(v_t_norm * v_t_norm + _V_EPS * _V_EPS)
+            f_t = -(mu * f_n_mag / v_eff) * v_t
 
         f_total = f_n + f_t
 

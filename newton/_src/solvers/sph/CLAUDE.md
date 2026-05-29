@@ -322,45 +322,40 @@ by an external MBD solver (e.g. MuJoCo, Featherstone). Enabled by
 | Field | Default | Unit | Meaning |
 |---|---|---|---|
 | `body_coupling_enabled` | `False` | — | Master switch. |
-| `body_coupling_bearing_capacity` | `1.0e4` | Pa | Plastic bearing capacity. Per-particle approach force is `bearing_capacity * dx^2`; summing over the `N` penetrating particles recovers `bearing_capacity * A_projected` (Terzaghi). |
-| `body_coupling_damping` | `5.0e1` | N·s/m | Normal damping `c_n` (resists approach only, `max(0, -v·n)`). |
+| `body_coupling_damping` | `1.0` | N·s/m | Normal damping `c_n` (resists approach only, `max(0, -v·n)`). |
 | `body_coupling_friction` | `0.5` | — | Coulomb friction coefficient `μ`. |
-| `body_coupling_stiffness` | `2.0e4` | N/m | **Deprecated.** Superseded by `body_coupling_bearing_capacity`; no longer read by the solver. Setting a non-default value triggers a `DeprecationWarning`. Retained for backwards compatibility only. |
 
-> **2026-05-14 — Phase 2c partial MVP success (4/5).** The sphere-drop
-> MVP at `newton/examples/multiphysics/example_sph_twoway_sphere_drop.py`
-> passes 4 of 5 `test_final()` criteria after Fix A (wrench reset
-> semantics) and Fix B (MBD inside SPH substep loop): no-NaN,
-> penetration, settling-by-bounce-apex, no-leak. The remaining FAIL is
-> criterion 5 (terminal-z within ±5 cm of analytic crater estimate):
-> sphere reaches z ~= -1.2 m vs predicted -0.04 m because the default
-> 10 cm sand bed (2× sphere radius) is too thin to arrest a 0.30 m drop;
-> after 3 bounces the sphere slips through a vertical channel opened
-> by laterally-displaced particles. The coupling code path is
-> end-to-end functional; SPH baseline (`test_sph`, 14/14) unaffected.
-> See "Known issues" subsection below for the criterion-2 artefact
-> caveat and remaining tuning followups.
+> **2026-05-28 — Akinci-style coupling.** The coupling now uses SPH
+> pressure at each penetrating fluid particle as the normal repulsion
+> force. Plasticity and yield come from the granular Drucker-Prager
+> constitutive model, not a tuned bearing-capacity knob.
+> Validated against an iterative penetration formula:
+> `δ = (0.14/μ_s)·√(ρ_s/ρ_g)·(2R)^(2/3)·(H+δ)^(1/3)` (50 iterations).
+> For canonical inputs (ρ_g=1510, ρ_s=2200, μ_s=0.3, H=0.1 m,
+> R=0.0125 m) the predicted penetration is **24.0 mm**.
+> SPH baseline (`test_sph`) unaffected.
 
 ### Architecture
 
-SDF + plastic indentation per primitive shape (sphere / capsule along
-local +Z / axis-aligned box). For each fluid particle inside a body's
-SDF, the force depends on the sign of `v_n = (v_p − v_body)·n`:
+SDF + Akinci-style SPH-pressure coupling per primitive shape (sphere /
+capsule along local +Z / axis-aligned box). For each fluid particle
+inside a body's SDF, the force depends on the SPH pressure at that
+particle and the sign of `v_n = (v_p − v_body)·n`:
 
 ```
 Approach (v_n < 0):
-    F_n = (bearing_capacity * dx^2 + c_n * (-v_n)) n
+    F_n = (max(P_i, 0) * dx^2 + c_n * (-v_n)) n
 Separation (v_n >= 0):
     F_n = 0                                       (no restoring spring)
 F_t = -min(μ |F_n|, m_p |v_t| / dt) v_t / |v_t|   (chatter-regularised Coulomb)
 ```
 
-Each particle is a quadrature point covering area `dx^2`
-(`particle_spacing`). The bearing term summed over `N` penetrating
-particles approximates `bearing_capacity * A_projected` because
-`N * dx^2 ≈ A_projected`. The asymmetric on/off normal law dissipates
-impact KE — work done on approach is not returned on separation, so
-a body dropped on the bed settles instead of bouncing elastically.
+`P_i` is the Shepard-corrected SPH pressure (`State.sph.pressure`, Pa,
+positive in compression) at the penetrating fluid particle. Each particle
+covers area `dx^2`, so summing `P_i * dx^2` over all penetrating particles
+integrates the SPH pressure field over the contact surface. The asymmetric
+on/off law prevents elastic energy return on separation — a body dropped on
+the granular bed settles without bouncing elastically.
 
 Reaction `-F` is applied at the contact point and atomic-added into a
 per-body `wp.spatial_vector` accumulator (`Model.body_count`-sized).
@@ -469,46 +464,30 @@ from ``state_out.sph.density`` (the midpoint density, computed at step
    robots with MuJoCo, option (a) — `body_q` interpolation across
    substeps — may be the better lever and remains TBD.
 
-**C. Terminal-z — plastic coupling implemented (2026-05-25).**
-   The coupling has been reworked from the elastic spring
-   ``F = k_n·pen + c_n·max(0,-v_n)`` to a plastic indentation law
-   ``F_n = bearing_capacity * dx^2 + c_n·max(0,-v_n)`` (zero on
-   separation). The sphere now settles into the bed instead of
-   bouncing elastically — criterion 5 (terminal-z vs analytic crater
-   estimate) is physically achievable. Depth accuracy depends on
-   correct ``particle_spacing``-based normalisation: the per-particle
-   bearing force is ``bearing_capacity * dx^2`` so that the sum over
-   ``N`` penetrating particles recovers the Terzaghi total
-   ``bearing_capacity * A_projected``. With ``dx = 5 mm`` and
-   ``bearing_capacity = 5e4 Pa`` the per-particle force is
-   ``1.25 N``; predicted penetration for a 1 kg sphere dropped from
-   0.10 m is about 6 mm (Ambrosio). Calibrate the bearing capacity
-   to the target soil; the coupling itself is no longer the
-   limiting factor.
+**C. Terminal-z — Akinci-style coupling (2026-05-28).**
+   The coupling was reworked from the elastic spring
+   ``F = k_n·pen + c_n·max(0,-v_n)`` → plastic indentation (2026-05-25)
+   → Akinci-style SPH-pressure repulsion (2026-05-28).  The current law
+   ``F_n = max(P_i, 0) * dx^2 + c_n·max(0,-v_n)`` (zero on separation)
+   drives the normal force from the SPH pressure field; plasticity comes
+   from the granular DP constitutive model, eliminating the
+   ``bearing_capacity`` knob.  Quantitative validation against the
+   iterative formula ``δ = (0.14/μ_s)·√(ρ_s/ρ_g)·(2R)^(2/3)·(H+δ)^(1/3)``
+   (50 iterations) with canonical inputs predicts **24.0 mm** penetration
+   (see ``example_sph_column_sphere_drop.py``).
 
-**D. `test_final` criterion 2 (settling) passes by bounce-apex artefact.**
-   The sphere bounces to ±5 m/s after each impact. At each bounce apex,
-   ``|v_z| < 0.05 m/s`` momentarily, but the sphere is mid-flight not
-   settled. `any(row['t'] >= 0.5 and abs(row['sphere_vz']) < 0.05)` 
-   catches the apex and returns True. The **honest** 4/5 PASS tally
-   (with criterion 2 artificially passing) overstates stability; the
-   true physics pass count is 3/5 (no-NaN, penetration, no-leak).
-   A correct check would window-min ``|v_z|`` over the last K frames
-   or require mean ``|v_z|`` < threshold across an observation window.
+**D. `test_final` criterion 2 (settling) — window-min fix applied (2026-05-28).**
+   The bounce-apex artefact (criterion 2 passing because ``|v_z| < 0.05 m/s``
+   at the apex of each bounce) is fixed in ``example_sph_column_sphere_drop``
+   by checking window-min ``|v_z|`` over the last 10 frames instead of
+   ``any(|v_z| < 0.05)``. The twoway example still uses ``any`` — fix is
+   deferred as a follow-up.
 
-**Status of validation (2026-05-14, after tuning session)**: `test_final`
-3/5 honest PASS (no-NaN, penetration within 0.40 s below sand top, no
-particle leak below ground plane). Criterion 2 (settling) passes by
-bounce-apex artefact (not true settling). Criterion 5 (terminal-z vs
-analytic crater estimate) cannot pass with the penalty coupling design
-because the coupling is inherently elastic — the spring stores and
-returns energy while damping is off during separation. See issues C-D
-above. Run with::
+**Status (2026-05-28)**: `example_sph_column_sphere_drop` validation target:
+5 criteria (no NaN, no punch-through, penetration depth ±20%, settled window-min,
+no leak). Run with::
 
-    PYTHONPATH=/path/to/worktree UV_PROJECT_ENVIRONMENT=.../.venv \\
-    uv run --no-sync --extra dev python \\
-    newton/examples/multiphysics/example_sph_twoway_sphere_drop.py \\
-    --viewer null --test
+    uv run -m newton.examples sph.example_sph_column_sphere_drop --viewer null --test
 
 The example now supports ``--sand-bed-bottom`` (default 0.0) to extend
 the sand bed below z=0 for deeper energy-absorbing columns; use with

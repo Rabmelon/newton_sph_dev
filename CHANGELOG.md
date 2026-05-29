@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Replace plastic-indentation SPH-body coupling with Akinci-style SPH-pressure coupling; remove `body_coupling_stiffness` and `body_coupling_bearing_capacity` `SolverSPH.Config` knobs and the `--body-coupling-bearing-capacity` / `--bearing-capacity` example CLI flags
+
+### Removed
+
+- Remove `_plastic_contact_area` SPH helper (was dead code, not called by any kernel)
+
 ### Added
 
 - Add opt-in `validate_mesh` parameter to `ModelBuilder.add_cloth_mesh()`, `ModelBuilder.add_soft_mesh()`, and `style3d.add_cloth_mesh()` that warns on degenerate geometry; add public `newton.utils.validate_triangle_mesh()` and `newton.utils.validate_tet_mesh()` utilities

@@ -4,18 +4,15 @@
 """SPH-rigid two-way coupling MVP: single sphere dropped into a sand bed.
 
 .. note::
-    **2026-05-25 — Plastic coupling rework.** The coupling is now a
-    plastic indentation law: per-particle normal force
-    ``F_n = bearing_capacity * dx^2 + c_n * max(0, -v_n)``, zero on
-    separation. Summed across the ``N`` penetrating particles this
-    recovers the Terzaghi total ``bearing_capacity * A_projected``.
-    The work done on approach is **not** returned on separation, so
-    criterion 5 (terminal-z within ±20 % of the analytic crater
-    estimate) is now physically achievable with correct tuning of
-    ``body_coupling_bearing_capacity`` and ``particle_spacing``.
-    See ``newton/_src/solvers/sph/CLAUDE.md §10b`` for the current
-    known-issues list. The SPH baseline (``test_sph``, 14/14) is
-    unaffected.
+    **2026-05-28 — Akinci-style coupling.** The coupling now uses SPH
+    pressure at each penetrating particle as the normal repulsion force:
+    ``F_n = max(P_i, 0) * dx^2 + c_n * max(0, -v_n)``.  Plasticity and
+    yield come from the granular Drucker-Prager constitutive model rather
+    than a tuned ``bearing_capacity`` knob.  The analytical penetration
+    estimate (criterion 5) now uses the same iterative formula as
+    ``example_sph_column_sphere_drop``.  See
+    ``newton/_src/solvers/sph/CLAUDE.md §10b`` for the current known-issues
+    list.
 
 Drops a 1 kg, 5 cm-radius rigid sphere from 0.10 m above the surface
 into a 0.40 x 0.40 x 0.30 m static sand bed (dx = 5 mm) enclosed in a
@@ -210,7 +207,6 @@ class Example:
         sph_cfg.body_coupling_enabled = True
         sph_cfg.body_coupling_damping = args.body_coupling_damping
         sph_cfg.body_coupling_friction = args.body_coupling_friction
-        sph_cfg.body_coupling_bearing_capacity = args.body_coupling_bearing_capacity
 
         # Per-particle material parameters (sand defaults, mirrors granular example)
         for attr in ("young_modulus", "poisson_ratio", "friction", "cohesion", "viscosity"):
@@ -519,28 +515,25 @@ class Example:
         plt.close(fig)
 
     def _predict_penetration(self) -> float:
-        """Newtonian crater-scaling estimate of final sphere bottom-z [m].
+        """Iterative penetration depth estimate [m, positive downward].
 
-        From energy balance: ``E_impact = sigma_y * V_crater``.  Approximate
-        the crater volume as ``V ~ A * z`` (cylindrical column under a
-        flat punch of area ``A = pi r^2`` with depth ``z``).  Then
-        ``z ~ E_impact / (sigma_y * A)``.  With m=1 kg, drop = 0.30 m,
-        g=9.81 m/s^2: ``E ~ 2.94 J``.  sigma_y ~ 10 kPa (loose sand
-        bearing capacity, Terzaghi-scale).  r=5 cm gives A=7.85e-3 m^2,
-        so z_crater ~ 0.037 m -- the sphere bottom rests near -3.7 cm.
+        Uses the same formula as ``example_sph_column_sphere_drop``:
 
-        This estimate is *deliberately rough*; the test tolerance is +/- 20 %
-        of |z|, but with an absolute floor of 5 cm to absorb sand-DP
-        parameter uncertainty.
+            delta_{n+1} = (0.14 / mu_s) * sqrt(rho_s / rho_g)
+                          * (2 * R)^(2/3) * (H + delta_n)^(1/3)
+
+        Sphere density is derived from ``--sphere-mass`` and ``--sphere-radius``.
         """
-        m = self.args.sphere_mass
-        g = abs(float(self.args.gravity[2]))
-        h = self.args.drop_height
         r = self.args.sphere_radius
-        sigma_y = self.args.bearing_capacity
-        e_impact = m * g * h
-        a = math.pi * r * r
-        return -e_impact / (sigma_y * a)
+        rho_s = self.args.sphere_mass / ((4.0 / 3.0) * math.pi * r**3)
+        rho_g = self.args.density
+        mu_s = self.args.body_coupling_friction
+        H = self.args.drop_height
+        delta = 0.0
+        coef = (0.14 / mu_s) * math.sqrt(rho_s / rho_g) * (2.0 * r) ** (2.0 / 3.0)
+        for _ in range(50):
+            delta = coef * (H + delta) ** (1.0 / 3.0)
+        return delta
 
     def test_final(self) -> None:
         # Ensure the CSV is flushed/closed before assertions so analysis has
@@ -599,16 +592,18 @@ class Example:
                     f"{self.args.sand_bed_bottom - self.args.particle_spacing:.4f}."
                 )
 
-        # 5) Sphere terminal bottom-z within +/- 20 % of analytical reference.
+        # 5) Sphere terminal penetration within +/- 20 % of iterative formula.
         if self.sim_time >= 0.5:
             z_final = last["sphere_z"] - radius  # bottom of sphere
-            z_predicted = self._predict_penetration()
-            tol = max(0.20 * abs(z_predicted), 0.05)  # absolute floor 5 cm
-            if abs(z_final - z_predicted) > tol:
+            delta_pred = self._predict_penetration()  # positive depth [m]
+            z_pred = self.args.sand_bed_top - delta_pred  # expected z of sphere bottom
+            tol = max(0.20 * delta_pred, 0.05)  # absolute floor 5 cm
+            if abs(z_final - z_pred) > tol:
                 raise ValueError(
                     f"Final sphere bottom z={z_final:.4f} m outside +/-{tol:.4f} m "
-                    f"of analytical estimate {z_predicted:.4f} m. "
-                    "Check sand stiffness / friction or rerun longer."
+                    f"of iterative-formula estimate {z_pred:.4f} m "
+                    f"(delta_pred={delta_pred * 1e3:.1f} mm). "
+                    "Check granular density / friction or rerun longer."
                 )
 
     def test_post_step(self) -> None:
@@ -673,7 +668,6 @@ class Example:
         # Coupling
         parser.add_argument("--body-coupling-damping", type=float, default=5.0e1)
         parser.add_argument("--body-coupling-friction", type=float, default=0.5)
-        parser.add_argument("--body-coupling-bearing-capacity", type=float, default=1.0e4)
         # Other simulation knobs
         parser.add_argument("--gravity", type=float, nargs=3, default=[0.0, 0.0, -9.81])
         parser.add_argument("--fps", type=float, default=50.0)
@@ -690,9 +684,6 @@ class Example:
             type=str,
             default=None,
             help="Path to save penetration-depth time-curve PNG. If omitted, figure is shown interactively.",
-        )
-        parser.add_argument(
-            "--bearing-capacity", type=float, default=1.0e4, help="sigma_y for analytical penetration depth [Pa]."
         )
         parser.add_argument(
             "--log-path",
