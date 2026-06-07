@@ -207,6 +207,75 @@ def _kernel_compute_embedded_reaction(
 
 
 @wp.kernel
+def _kernel_compute_hu_reaction_force(
+    grid: wp.uint64,
+    pos: wp.array[wp.vec3],
+    rho: wp.array[float],
+    stress: wp.array[wp.mat33],
+    mass: wp.array[float],
+    particle_type: wp.array[wp.int32],
+    particle_flags: wp.array[wp.int32],
+    embedded_start: int,
+    embedded_end: int,
+    embedded_stress: wp.array[wp.mat33],
+    h: float,
+    support_radius: float,
+    sphere_force: wp.array[wp.vec3],
+):
+    """Hu et al. (2021) Eq. 15 body force ``F = sum_d m_d * a_d``.
+
+    For each embedded dummy *d*, computes the SPH stress-divergence
+    acceleration evaluated at the dummy's position using the consistent
+    form (Hu Eq. 9 with ``G_d = I`` approximation, valid for embedded
+    particles with reasonably full kernel support).  Sums ``m_d * a_d``
+    into the body-force accumulator.
+
+    Unlike a symmetric-Monaghan reaction force, this evaluation is
+    consistent with the corrected-gradient SPH integration used by the
+    fluid: both fluid and dummy accelerations are computed from the same
+    discrete ``(sigma_j - sigma_d) * grad_w`` form, so momentum is
+    approximately conserved in the continuum limit.
+    """
+    local_d = wp.tid()
+    if local_d >= (embedded_end - embedded_start):
+        return
+    d = embedded_start + local_d
+
+    xd = pos[d]
+    sigma_d = embedded_stress[local_d]
+    rho_d = _RHO_GRANULAR_C
+    m_d = mass[d]
+    a_d = wp.vec3(0.0)
+
+    query = wp.hash_grid_query(grid, xd, support_radius)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if (particle_flags[j] & ParticleFlags.ACTIVE) == 0:
+            continue
+        if particle_type[j] != SPH_FLUID:
+            continue
+
+        xj = pos[j]
+        r_vec = xd - xj
+        r = wp.length(r_vec)
+        if r > support_radius or r < _EPSILON:
+            continue
+
+        rho_j = rho[j]
+        if rho_j < _EPSILON:
+            continue
+
+        sigma_j = stress[j]
+        m_j = mass[j]
+        V_j = m_j / rho_j
+
+        grad_w = wendland_c2_grad_3d(r_vec, r, h)
+        a_d += (V_j / rho_d) * ((sigma_j - sigma_d) @ grad_w)
+
+    wp.atomic_add(sphere_force, 0, m_d * a_d)
+
+
+@wp.kernel
 def _kernel_update_dummy_block(
     pos: wp.array[wp.vec3],
     vel: wp.array[wp.vec3],
@@ -426,6 +495,12 @@ class Example:
         cfg.artificial_viscosity_alpha = args.artificial_viscosity_alpha
         cfg.body_coupling_enabled = False
         cfg.use_consistent_discretization = args.use_consistent_discretization
+        # Hu 2021 §3.1: G_i corrected gradient is intrinsically unstable
+        # without companion stabilisation (PPST or XSPH ≥ 0.3); enable XSPH
+        # automatically whenever the corrected gradient is selected.
+        cfg.xsph_epsilon = args.xsph_epsilon if args.xsph_epsilon is not None else (
+            0.5 if args.use_consistent_discretization else 0.0
+        )
 
         self.model.sph.young_modulus.fill_(1.0e6)
         self.model.sph.poisson_ratio.fill_(0.3)
@@ -557,31 +632,68 @@ class Example:
         self.state_0.sph.stress.assign(stress_np)
 
     def _compute_reaction_force(self) -> float:
-        """Total vertical SPH force on sphere (Hu 2021 interpolated stress)."""
+        """Total vertical SPH force on sphere.
+
+        Two paths:
+
+        - **Symmetric** (``use_consistent_discretization = False``): use the
+          pairwise Monaghan stress force evaluated at every fluid-dummy pair,
+          atomic-summed onto the sphere with opposite sign (Newton's 3rd law
+          per pair).
+        - **Hu Eq. 15** (``use_consistent_discretization = True``): evaluate
+          the corrected-gradient SPH acceleration at each dummy position d,
+          then ``F_body = sum_d m_d * a_d``.  This matches the consistent
+          stress-divergence used by the fluid integrator so momentum is
+          approximately conserved in the continuum limit.
+        """
         if self.sphere_dummy_count == 0:
             return 0.0
 
         self._sphere_force.zero_()
-        wp.launch(
-            _kernel_compute_embedded_reaction,
-            dim=self.model.particle_count,
-            inputs=[
-                self._reaction_grid.id,
-                self.state_0.particle_q,
-                self.state_0.sph.density,
-                self.state_0.sph.stress,
-                self.model.particle_mass,
-                self.model.sph.particle_type,
-                self.model.particle_flags,
-                self.sphere_dummy_start,
-                self.sphere_dummy_end,
-                self._embedded_stress,
-                self._h,
-                self._support_radius,
-            ],
-            outputs=[self._sphere_force],
-            device=self.model.device,
-        )
+        if self.args.use_consistent_discretization or self.args.use_hu_reaction:
+            # Hu Eq. 15: F = sum_d m_d * a_d evaluated at embedded dummies.
+            wp.launch(
+                _kernel_compute_hu_reaction_force,
+                dim=self.sphere_dummy_count,
+                inputs=[
+                    self._reaction_grid.id,
+                    self.state_0.particle_q,
+                    self.state_0.sph.density,
+                    self.state_0.sph.stress,
+                    self.model.particle_mass,
+                    self.model.sph.particle_type,
+                    self.model.particle_flags,
+                    self.sphere_dummy_start,
+                    self.sphere_dummy_end,
+                    self._embedded_stress,
+                    self._h,
+                    self._support_radius,
+                ],
+                outputs=[self._sphere_force],
+                device=self.model.device,
+            )
+        else:
+            # Symmetric Monaghan pair force, summed over fluid-dummy pairs.
+            wp.launch(
+                _kernel_compute_embedded_reaction,
+                dim=self.model.particle_count,
+                inputs=[
+                    self._reaction_grid.id,
+                    self.state_0.particle_q,
+                    self.state_0.sph.density,
+                    self.state_0.sph.stress,
+                    self.model.particle_mass,
+                    self.model.sph.particle_type,
+                    self.model.particle_flags,
+                    self.sphere_dummy_start,
+                    self.sphere_dummy_end,
+                    self._embedded_stress,
+                    self._h,
+                    self._support_radius,
+                ],
+                outputs=[self._sphere_force],
+                device=self.model.device,
+            )
         f_np = self._sphere_force.numpy()
         return float(f_np[0, 2])
 
@@ -598,7 +710,9 @@ class Example:
             # 2. Reaction force from interpolated stress (same as SPH solver)
             f_z = self._compute_reaction_force()
 
-            # 3. Integrate sphere free-fall motion
+            # 3. Integrate sphere free-fall motion (no SPH feedback when --no-sphere-feedback)
+            if getattr(self.args, "no_sphere_feedback", False):
+                f_z = 0.0
             self._sphere_vz += (gz + f_z / self._sphere_mass) * self.sim_dt
             self._sphere_z += self._sphere_vz * self.sim_dt
 
@@ -769,6 +883,26 @@ class Example:
             action="store_true",
             help="Enable Hu 2021 CMAME G_i corrected-gradient discretization",
         )
+        parser.add_argument(
+            "--use-hu-reaction",
+            action="store_true",
+            help="Use Hu 2021 Eq. 15 (F = sum m_d a_d) reaction force; independent of --use-consistent-discretization",
+        )
+        parser.add_argument(
+            "--no-sphere-feedback",
+            action="store_true",
+            help="Disable SPH→sphere reaction force (diagnostic: free-fall only)",
+        )
+        parser.add_argument(
+            "--xsph-epsilon",
+            type=float,
+            default=None,
+            help=(
+                "XSPH velocity-smoothing factor [0-1].  Auto: 0.5 when "
+                "--use-consistent-discretization is set (Hu 2021 stability "
+                "companion); 0.0 otherwise."
+            ),
+        )
         return parser
 
 
@@ -811,6 +945,7 @@ if __name__ == "__main__":
                 use_consistent_discretization=getattr(
                     args, "use_consistent_discretization", False
                 ),
+                xsph_epsilon=getattr(args, "xsph_epsilon", None),
             )
             sweep_viewer = ViewerNull(num_frames=10000)
             ex = Example(sweep_viewer, sweep_args)
