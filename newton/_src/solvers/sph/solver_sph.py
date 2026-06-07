@@ -800,6 +800,12 @@ class SolverSPH(SolverBase):
         vg = velocity_gradient if velocity_gradient is not None else state_in.sph.velocity_gradient
         # Copy plastic_strain from state_in to state_out for accumulation
         wp.copy(state_out.sph.plastic_strain, state_in.sph.plastic_strain)
+        # Propagate stress in→out for non-fluid particles.  The DP kernel skips
+        # them and would otherwise leave state_out.sph.stress at its previous-
+        # step (possibly stale) value; downstream stress-force reads from
+        # state_out, so non-fluid stresses (e.g. Shepard-interpolated embedded
+        # dummy stress) must be carried through here.
+        wp.copy(state_out.sph.stress, state_in.sph.stress)
         wp.launch(
             update_stress_dp_kernel,
             dim=self._fluid_count,
@@ -838,6 +844,8 @@ class SolverSPH(SolverBase):
         """
         sr = strain_rate if strain_rate is not None else state_in.sph.strain_rate
         rho = density if density is not None else state_in.sph.density
+        # Propagate non-fluid stress in→out (mui kernel skips non-fluid).
+        wp.copy(state_out.sph.stress, state_in.sph.stress)
         wp.launch(
             update_stress_mui_kernel,
             dim=self._fluid_count,
