@@ -52,6 +52,7 @@ from .sph_kernels import (
     integrate_verlet_final_kernel,
     make_compute_artificial_viscosity_kernel,
     make_compute_density_kernel,
+    make_compute_correction_matrix_kernel,
     make_compute_stress_force_kernel,
     make_compute_velocity_gradient_kernel,
     make_xsph_correction_kernel,
@@ -122,6 +123,19 @@ class SolverSPH(SolverBase):
         # --- Corrections ---
         xsph_epsilon: float = 0.0
         """XSPH velocity smoothing factor (0 = off, 1 = full)."""
+        use_consistent_discretization: bool = False
+        """Hu et al. (2021) CMAME first-order-consistent gradient correction.
+
+        When True, the velocity-gradient and stress-force kernels compute the
+        per-fluid-particle 3x3 renormalisation matrix
+        ``G_i = (-Σ V_j r_ij ⊗ ∇W_ij)^{-1}`` and replace ``∇W_ij`` with
+        ``G_i · ∇W_ij`` in both kernels. This restores linear-field
+        consistency at boundaries where kernel support is truncated, at
+        the cost of pairwise momentum-conservation symmetry.
+
+        Default ``False`` to preserve the symmetric pressure-gradient form
+        used by all existing tests and validation experiments.
+        """
 
         # --- Two-way coupling with rigid bodies (MBD) ---
         body_coupling_enabled: bool = False
@@ -329,11 +343,24 @@ class SolverSPH(SolverBase):
         # must not use ``_fluid_count < n`` because the non-contiguous fallback
         # above forces ``_fluid_count = n`` even when dummies are present.
         self._has_dummies = bool(np.any(pt != 0))
+        self._use_consistent = config.use_consistent_discretization
         self._density_kernel = make_compute_density_kernel(self._has_dummies)
-        self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(self._has_dummies)
-        self._stress_force_kernel = make_compute_stress_force_kernel(self._has_dummies)
+        self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(
+            self._has_dummies, self._use_consistent
+        )
+        self._stress_force_kernel = make_compute_stress_force_kernel(
+            self._has_dummies, self._use_consistent
+        )
         self._artificial_viscosity_kernel = make_compute_artificial_viscosity_kernel(self._has_dummies)
         self._xsph_kernel = make_xsph_correction_kernel(self._has_dummies)
+
+        # Hu 2021 G_i scratch (only when consistent discretisation is enabled)
+        if self._use_consistent:
+            self._correction_matrix_kernel = make_compute_correction_matrix_kernel(self._has_dummies)
+            self._correction_matrix = wp.zeros(n, dtype=wp.mat33, device=model.device)
+        else:
+            self._correction_matrix_kernel = None
+            self._correction_matrix = None
 
     def _extract_gravity_vec(self) -> wp.vec3:
         """Extract gravity as a :class:`wp.vec3` from the model array."""
@@ -458,6 +485,9 @@ class SolverSPH(SolverBase):
         # 2. Compute density (stored on state_in for use during force computation)
         self._compute_density(state_in)
 
+        # 2b. Hu 2021 G_i correction matrix (no-op when use_consistent_discretization is False)
+        self._compute_correction_matrix(state_in)
+
         # 3. Zero acceleration (cudaMemset is cheaper than a kernel launch)
         self._accel.zero_()
 
@@ -531,6 +561,9 @@ class SolverSPH(SolverBase):
         # 3. Compute density at midpoint -> write to state_out
         #    Use state_in density as Shepard correction reference (not stale state_out)
         self._compute_density(state_out, pos=self._pos_mid, density_prev_source=state_in.sph.density)
+
+        # 3b. Hu 2021 G_i correction at midpoint (no-op when disabled)
+        self._compute_correction_matrix(state_out, pos=self._pos_mid)
 
         # 4. Zero acceleration
         self._accel.zero_()
@@ -654,6 +687,34 @@ class SolverSPH(SolverBase):
             device=self.model.device,
         )
 
+    def _compute_correction_matrix(
+        self,
+        state: newton.State,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+    ) -> None:
+        """Compute Hu 2021 G_i correction matrix from current positions and density."""
+        if not self._use_consistent:
+            return
+        positions = pos if pos is not None else state.particle_q
+        wp.launch(
+            self._correction_matrix_kernel,
+            dim=self._fluid_count,
+            inputs=[
+                self._hash_grid.id,
+                positions,
+                self.model.particle_mass,
+                state.sph.density,
+                self.model.particle_flags,
+                self._particle_type,
+                self._h,
+                self._support_radius,
+                self._config.reference_density,
+            ],
+            outputs=[self._correction_matrix],
+            device=self.model.device,
+        )
+
     def _compute_velocity_gradient(
         self,
         state: newton.State,
@@ -664,6 +725,29 @@ class SolverSPH(SolverBase):
         """Compute SPH velocity gradient tensor."""
         positions = pos if pos is not None else state.particle_q
         velocities = vel if vel is not None else state.particle_qd
+        if self._use_consistent:
+            wp.launch(
+                self._velocity_gradient_kernel,
+                dim=self._fluid_count,
+                inputs=[
+                    self._hash_grid.id,
+                    positions,
+                    velocities,
+                    self.model.particle_mass,
+                    state.sph.density,
+                    self._correction_matrix,
+                    self.model.particle_flags,
+                    self._particle_type,
+                    self._wall_normal,
+                    self._h,
+                    self._support_radius,
+                    self._config.dummy_beta,
+                    self._config.reference_density,
+                ],
+                outputs=[state.sph.velocity_gradient],
+                device=self.model.device,
+            )
+            return
         wp.launch(
             self._velocity_gradient_kernel,
             dim=self._fluid_count,
@@ -792,6 +876,28 @@ class SolverSPH(SolverBase):
         positions = pos if pos is not None else state_in.particle_q
         rho = density if density is not None else state_in.sph.density
         gravity_vec = self._gravity_vec
+        if self._use_consistent:
+            wp.launch(
+                self._stress_force_kernel,
+                dim=self._fluid_count,
+                inputs=[
+                    self._hash_grid.id,
+                    positions,
+                    self.model.particle_mass,
+                    rho,
+                    state_out.sph.stress,
+                    self._correction_matrix,
+                    self.model.particle_flags,
+                    self._particle_type,
+                    self._h,
+                    self._support_radius,
+                    self._config.reference_density,
+                    gravity_vec,
+                ],
+                outputs=[self._accel],
+                device=self.model.device,
+            )
+            return
         wp.launch(
             self._stress_force_kernel,
             dim=self._fluid_count,

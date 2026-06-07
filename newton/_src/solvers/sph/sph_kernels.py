@@ -34,6 +34,16 @@ wp.set_module_options({"enable_backward": False})
 
 _PI = wp.constant(3.14159265358979323846)
 _EPSILON = wp.constant(1.0e-8)
+_G_MAX_DEVIATION_SQ = wp.constant(0.25)
+"""Frobenius-squared cap on ``G_i - I`` for the Hu 2021 correction matrix.
+
+Default 0.25 (Frobenius norm 0.5): only accept the corrected gradient when
+``G_i`` deviates modestly from the identity.  Half-stencil boundary particles
+typically produce ``|G_i|`` of order 2-5 in the wall-normal direction; rejecting
+those configurations falls back to the uncorrected symmetric SPH gradient and
+keeps the simulation stable.  Interior particles with full kernel support are
+unaffected (``G_i`` ≈ identity).
+"""
 
 # ---------------------------------------------------------------------------
 # Wendland C2 kernel (3D)
@@ -549,6 +559,92 @@ def integrate_verlet_final_kernel(
 _SPECIALIZED_KERNEL_OPTIONS_PHASE_A = {"fast_math": True, "enable_backward": False}
 
 
+def make_compute_correction_matrix_kernel(has_dummies: bool):
+    """Factory for the Hu et al. (2021) CMAME 3x3 renormalisation matrix ``G_i``.
+
+    Computes
+    :math:`G_i^{-1} = -\\sum_j V_j\\, r_{ij}\\otimes\\nabla W_{ij}`
+    where :math:`r_{ij} = x_i - x_j` and :math:`V_j = m_j / \\rho_j`. The
+    inverse is taken per particle; if the determinant collapses below
+    ``_EPSILON`` the kernel falls back to the identity matrix, recovering the
+    standard (non-corrected) gradient locally.
+
+    Dummy neighbours contribute with ``rho_j = reference_density`` and an
+    *embedded* dummy's ``V_j`` reflects its assigned mass; this matches the
+    convention used by the velocity-gradient and stress-force kernels so the
+    correction matrix is computed against the same neighbour stencil.
+    """
+
+    @fem.cache.dynamic_kernel(
+        suffix=has_dummies,
+        kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
+    )
+    def compute_correction_matrix_kernel_impl(
+        grid: wp.uint64,
+        pos: wp.array[wp.vec3],
+        mass: wp.array[float],
+        density: wp.array[float],
+        particle_flags: wp.array[wp.int32],
+        particle_type: wp.array[wp.int32],
+        h: float,
+        support_radius: float,
+        reference_density: float,
+        correction_matrix: wp.array[wp.mat33],
+    ):
+        i = wp.tid()
+        if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+            correction_matrix[i] = wp.identity(3, float)
+            return
+        if particle_type[i] != SPH_FLUID:
+            correction_matrix[i] = wp.identity(3, float)
+            return
+
+        xi = pos[i]
+        G_inv = wp.mat33(0.0)
+
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        j = int(0)
+        while wp.hash_grid_query_next(query, j):
+            if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and j != i:
+                xj = pos[j]
+                r_vec = xi - xj
+                r = wp.length(r_vec)
+                if r < support_radius and r > _EPSILON:
+                    rho_j = density[j]
+                    if wp.static(has_dummies):
+                        if particle_type[j] != SPH_FLUID:
+                            rho_j = reference_density
+                    if rho_j > _EPSILON:
+                        V_j = mass[j] / rho_j
+                        grad_w = wendland_c2_grad_3d(r_vec, r, h)
+                        G_inv -= V_j * wp.outer(r_vec, grad_w)
+
+        # Robust inverse. Hu 2021's G_i is exact only for full kernel support;
+        # near boundaries (truncated stencil), G_i^{-1} can be near-singular or
+        # produce a corrected gradient much larger than the uncorrected one.
+        # Fall back to identity when:
+        #   (a) determinant is below _EPSILON (singular), or
+        #   (b) the inverse's Frobenius norm grows beyond ``_G_MAX``, indicating
+        #       an ill-conditioned stencil that would amplify discretization noise.
+        det = wp.determinant(G_inv)
+        if wp.abs(det) <= _EPSILON:
+            correction_matrix[i] = wp.identity(3, float)
+            return
+        G = wp.inverse(G_inv)
+        # Frobenius-squared norm of (G - I), bounded; if too large, fall back.
+        diff = G - wp.identity(3, float)
+        norm_sq = float(0.0)
+        for r_idx in range(3):
+            for c_idx in range(3):
+                norm_sq += diff[r_idx, c_idx] * diff[r_idx, c_idx]
+        if norm_sq > _G_MAX_DEVIATION_SQ:
+            correction_matrix[i] = wp.identity(3, float)
+        else:
+            correction_matrix[i] = G
+
+    return compute_correction_matrix_kernel_impl
+
+
 def make_compute_density_kernel(has_dummies: bool):
     """Factory for a Shepard-corrected density kernel specialized on ``has_dummies``."""
 
@@ -603,11 +699,79 @@ def make_compute_density_kernel(has_dummies: bool):
     return compute_density_kernel_impl
 
 
-def make_compute_velocity_gradient_kernel(has_dummies: bool):
-    """Factory for a velocity-gradient kernel specialized on ``has_dummies``."""
+def make_compute_velocity_gradient_kernel(has_dummies: bool, use_consistent: bool = False):
+    """Factory for a velocity-gradient kernel.
+
+    Specialised on ``has_dummies`` and ``use_consistent``.  When
+    ``use_consistent`` is True the kernel accepts an extra
+    ``correction_matrix`` argument and computes
+    :math:`L_i = \\sum_j V_j\\,(\\mathbf{v}_j - \\mathbf{v}_i)\\otimes(G_i\\cdot\\nabla W_{ij})`,
+    the Hu 2021 corrected gradient. Otherwise the standard
+    :math:`L_i = \\sum_j (m_j/\\rho_j)(\\mathbf{v}_j - \\mathbf{v}_i)\\otimes\\nabla W_{ij}`
+    is used (mathematically equivalent when ``G_i = I``).
+    """
+
+    if use_consistent:
+
+        @fem.cache.dynamic_kernel(
+            suffix=(has_dummies, use_consistent),
+            kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
+        )
+        def compute_velocity_gradient_kernel_impl_consistent(
+            grid: wp.uint64,
+            pos: wp.array[wp.vec3],
+            vel: wp.array[wp.vec3],
+            mass: wp.array[float],
+            density: wp.array[float],
+            correction_matrix: wp.array[wp.mat33],
+            particle_flags: wp.array[wp.int32],
+            particle_type: wp.array[wp.int32],
+            wall_normal: wp.array[wp.vec3],
+            h: float,
+            support_radius: float,
+            dummy_beta: float,
+            reference_density: float,
+            velocity_gradient: wp.array[wp.mat33],
+        ):
+            i = wp.tid()
+            if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+                velocity_gradient[i] = wp.mat33(0.0)
+                return
+            if particle_type[i] != SPH_FLUID:
+                velocity_gradient[i] = wp.mat33(0.0)
+                return
+
+            xi = pos[i]
+            vi = vel[i]
+            G_i = correction_matrix[i]
+            L = wp.mat33(0.0)
+
+            query = wp.hash_grid_query(grid, xi, support_radius)
+            j = int(0)
+            while wp.hash_grid_query_next(query, j):
+                if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and j != i:
+                    xj = pos[j]
+                    r_vec = xi - xj
+                    r = wp.length(r_vec)
+                    if r < support_radius and r > _EPSILON:
+                        vj = vel[j]
+                        rho_j = density[j]
+                        if wp.static(has_dummies):
+                            if particle_type[j] != SPH_FLUID:
+                                vj = compute_virtual_velocity(vi, vel[j], dummy_beta, wall_normal[j], particle_type[j])
+                                rho_j = reference_density
+                        if rho_j > _EPSILON:
+                            grad_w = wendland_c2_grad_3d(r_vec, r, h)
+                            corrected_grad = G_i @ grad_w
+                            V_j = mass[j] / rho_j
+                            L += V_j * wp.outer(vj - vi, corrected_grad)
+
+            velocity_gradient[i] = L
+
+        return compute_velocity_gradient_kernel_impl_consistent
 
     @fem.cache.dynamic_kernel(
-        suffix=has_dummies,
+        suffix=(has_dummies, use_consistent),
         kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
     )
     def compute_velocity_gradient_kernel_impl(
@@ -661,11 +825,97 @@ def make_compute_velocity_gradient_kernel(has_dummies: bool):
     return compute_velocity_gradient_kernel_impl
 
 
-def make_compute_stress_force_kernel(has_dummies: bool):
-    """Factory for a stress-divergence force kernel specialized on ``has_dummies``."""
+def make_compute_stress_force_kernel(has_dummies: bool, use_consistent: bool = False):
+    """Factory for a stress-divergence force kernel.
+
+    Specialised on ``has_dummies`` (boundary substitution branches) and
+    ``use_consistent`` (Hu 2021 corrected-gradient form). When
+    ``use_consistent`` is True, the kernel accepts an extra
+    ``correction_matrix`` argument and computes
+
+    .. math::
+
+        \\frac{d\\mathbf{u}_i}{dt} = \\frac{1}{\\rho_i} \\sum_j (\\boldsymbol{\\sigma}_j - \\boldsymbol{\\sigma}_i)\\,
+        (G_i \\cdot \\nabla W_{ij})\\, V_j
+
+    instead of the symmetric pressure-gradient form
+    :math:`m_j (\\sigma_i / \\rho_i^2 + \\sigma_j / \\rho_j^2) \\nabla W_{ij}`.
+    The corrected form is first-order consistent under truncated kernel
+    support, at the cost of pairwise momentum-conservation symmetry.
+    """
+
+    if use_consistent:
+
+        @fem.cache.dynamic_kernel(
+            suffix=(has_dummies, use_consistent),
+            kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
+        )
+        def compute_stress_force_kernel_impl_consistent(
+            grid: wp.uint64,
+            pos: wp.array[wp.vec3],
+            mass: wp.array[float],
+            density: wp.array[float],
+            stress: wp.array[wp.mat33],
+            correction_matrix: wp.array[wp.mat33],
+            particle_flags: wp.array[wp.int32],
+            particle_type: wp.array[wp.int32],
+            h: float,
+            support_radius: float,
+            reference_density: float,
+            gravity: wp.vec3,
+            accel: wp.array[wp.vec3],
+        ):
+            i = wp.tid()
+            if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+                return
+            if particle_type[i] != SPH_FLUID:
+                return
+
+            xi = pos[i]
+            rho_i = density[i]
+            if rho_i < _EPSILON:
+                return
+
+            sigma_i = stress[i]
+            G_i = correction_matrix[i]
+            a = wp.vec3(0.0)
+
+            query = wp.hash_grid_query(grid, xi, support_radius)
+            j = int(0)
+            while wp.hash_grid_query_next(query, j):
+                if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and j != i:
+                    xj = pos[j]
+                    r_vec = xi - xj
+                    r = wp.length(r_vec)
+                    if r < support_radius and r > _EPSILON:
+                        sigma_j = stress[j]
+                        rho_j = density[j]
+                        if wp.static(has_dummies):
+                            if particle_type[j] == SPH_DUMMY_EMBEDDED:
+                                sigma_j = stress[j]
+                                rho_j = reference_density
+                            elif particle_type[j] != SPH_FLUID:
+                                sigma_j = compute_virtual_stress(
+                                    reference_density,
+                                    gravity,
+                                    xi,
+                                    xj,
+                                    sigma_i,
+                                    particle_type[j],
+                                )
+                                rho_j = reference_density
+                        if rho_j > _EPSILON:
+                            grad_w = wendland_c2_grad_3d(r_vec, r, h)
+                            corrected_grad = G_i @ grad_w
+                            V_j = mass[j] / rho_j
+                            a += (V_j / rho_i) * ((sigma_j - sigma_i) @ corrected_grad)
+
+            accel[i] = accel[i] + a
+
+        return compute_stress_force_kernel_impl_consistent
 
     @fem.cache.dynamic_kernel(
-        suffix=has_dummies,
+        suffix=(has_dummies, use_consistent),
         kernel_options=_SPECIALIZED_KERNEL_OPTIONS_PHASE_A,
     )
     def compute_stress_force_kernel_impl(
@@ -708,9 +958,6 @@ def make_compute_stress_force_kernel(has_dummies: bool):
                     rho_j = density[j]
                     if wp.static(has_dummies):
                         if particle_type[j] == SPH_DUMMY_EMBEDDED:
-                            # Hu et al. (2021): kernel-interpolated stress (no hydrostatic
-                            # correction).  The caller must write the interpolated value
-                            # into ``stress[j]`` before launching this kernel.
                             sigma_j = stress[j]
                             rho_j = reference_density
                         elif particle_type[j] != SPH_FLUID:
