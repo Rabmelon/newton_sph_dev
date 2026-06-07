@@ -425,6 +425,7 @@ class Example:
         cfg.sound_speed = sound_speed
         cfg.artificial_viscosity_alpha = args.artificial_viscosity_alpha
         cfg.body_coupling_enabled = False
+        cfg.use_consistent_discretization = args.use_consistent_discretization
 
         self.model.sph.young_modulus.fill_(1.0e6)
         self.model.sph.poisson_ratio.fill_(0.3)
@@ -763,6 +764,11 @@ class Example:
             default=0.1,
             help="Monaghan artificial viscosity alpha coefficient [default: 0.1]",
         )
+        parser.add_argument(
+            "--use-consistent-discretization",
+            action="store_true",
+            help="Enable Hu 2021 CMAME G_i corrected-gradient discretization",
+        )
         return parser
 
 
@@ -801,6 +807,9 @@ if __name__ == "__main__":
                 test=False,
                 artificial_viscosity_alpha=getattr(
                     args, "artificial_viscosity_alpha", 0.1
+                ),
+                use_consistent_discretization=getattr(
+                    args, "use_consistent_discretization", False
                 ),
             )
             sweep_viewer = ViewerNull(num_frames=10000)
