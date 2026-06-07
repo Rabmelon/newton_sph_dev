@@ -917,7 +917,7 @@ class SolverSPH(SolverBase):
                 self._particle_type,
                 state.sph.density,
                 self.model.particle_mass,
-                state.sph.pressure,
+                state.sph.stress,
                 state.body_q,
                 state.body_qd,
                 self.model.body_com,

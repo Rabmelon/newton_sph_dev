@@ -358,8 +358,8 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
-        parser.add_argument("--fps", type=float, default=60.0)
-        parser.add_argument("--duration", type=float, default=0.8, help="Simulation duration [s]")
+        parser.add_argument("--fps", type=float, default=100.0)
+        parser.add_argument("--duration", type=float, default=0.1, help="Simulation duration [s]")
         parser.add_argument("--sphere-radius", type=float, default=0.0125, help="Sphere radius [m]")
         parser.add_argument(
             "--sphere-density",

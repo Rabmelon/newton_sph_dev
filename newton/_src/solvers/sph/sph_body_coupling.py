@@ -9,12 +9,15 @@ inside a body collider, the normal force depends on the SPH pressure at that
 particle and the sign of the relative normal velocity
 ``v_n = (v_p - v_body_at_x) . n``:
 
-    Approach (v_n < 0):
-        F_n = (max(P_i, 0) * dx^2 + c_n * (-v_n)) * n
-    Separation (v_n >= 0):
-        F_n = 0     (no restoring spring — sand does not pull the body back)
+    Always (particle inside collider):
+        F_n = (max(-n^T σ n, 0) * dx^2 + c_n * max(0, -v_n)) * n
+    where ``n^T σ n`` is the full Cauchy stress traction projected onto the
+    contact normal, capturing both mean pressure and the deviatoric component
+    that depends on the DP friction angle.  Damping is one-sided (approach only).
 
-    F_t = -mu * |F_n| * v_t / sqrt(|v_t|^2 + V_EPS^2)   (smooth Coulomb, V_EPS = 1 mm/s)
+    F_t = -mu * |F_n| * g_tan / |g_tan|   (gravity-tangential static friction)
+    where g_tan = anti_g - (anti_g . n) n  (tangential projection of Z-up onto
+    contact plane).  Provides stable Coulomb friction when v_sphere ≈ 0.
 
 ``P_i`` is the Shepard-corrected SPH pressure (``State.sph.pressure``, Pa,
 positive in compression) at the penetrating fluid particle. Each SPH particle
@@ -174,7 +177,7 @@ def apply_body_coupling_force_kernel(
     particle_type: wp.array[wp.int32],
     particle_density: wp.array[float],
     particle_mass: wp.array[float],
-    particle_pressure: wp.array[float],
+    particle_stress: wp.array[wp.mat33],
     # body inputs
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
@@ -201,9 +204,10 @@ def apply_body_coupling_force_kernel(
     integrates the pressure field over the contact surface; plasticity and yield
     come from the granular constitutive model (Drucker-Prager), not a tuned knob.
 
-    Normal force while ``v_n < 0`` (approach): ``(max(P_i, 0) * dx^2 + c_n * (-v_n)) * n``.
-    Zero on separation — sand does not pull the body back. Body pose is frozen
-    during the SPH substep loop.
+    Normal force: ``(max(P_i, 0) * dx^2 + c_n * max(0, -v_n)) * n`` for all
+    penetrating particles (velocity gate removed).  Damping is one-sided so no
+    energy is added on separation, but the pressure term remains active.  Body
+    pose is frozen during the SPH substep loop.
 
     The equal-and-opposite wrench is atomic-added to ``body_f_sand`` at the
     body's COM as ``wp.spatial_vector(force_world, torque_world)``.
@@ -216,9 +220,11 @@ def apply_body_coupling_force_kernel(
         particle_density: Per-particle density [kg/m^3]; particles with
             non-positive or non-finite density are skipped.
         particle_mass: Per-particle mass [kg].
-        particle_pressure: Per-particle SPH pressure [Pa], positive in compression
-            (``State.sph.pressure``). Only the compressive part (``max(P, 0)``)
-            contributes to the normal repulsion.
+        particle_stress: Per-particle Cauchy stress tensor [Pa] (``State.sph.stress``,
+            compression negative).  The contact-normal traction ``n^T σ n`` is
+            projected at each penetrating particle; only the compressive part
+            (``max(-n^T σ n, 0)``) contributes to the normal repulsion, capturing
+            both mean pressure and the DP-friction-angle-dependent deviatoric part.
         body_q: Body transforms (world).
         body_qd: Body twists (linear, angular) in world frame.
         body_com: Body COM offsets [m] in body-local frame.
@@ -278,26 +284,28 @@ def apply_body_coupling_force_kernel(
         v_n = wp.dot(v_rel, n_w)
         v_t = v_rel - v_n * n_w
 
-        # Akinci-style coupling: no restoring force on separation.
-        # Approach: SPH pressure at penetrating particle * per-particle quadrature
-        # area + rate damping. Summing P_i * dx^2 integrates the SPH pressure field
-        # over the contact surface; plasticity comes from the granular DP model.
-        # Separation: zero force — no energy returned to body.
-        if v_n >= 0.0:
-            continue
+        # Full Cauchy stress traction: n^T σ n captures mean pressure AND the
+        # deviatoric component governed by the DP friction angle.  Compressive
+        # convention: σ < 0 → -t_n > 0 → repulsive.  Damping is approach-only.
         particle_area = particle_spacing * particle_spacing
-        p_repel = wp.max(particle_pressure[pid], 0.0)
-        f_n_mag = p_repel * particle_area + c_n * (-v_n)
+        sigma = particle_stress[pid]
+        t_n = wp.dot(n_w, sigma @ n_w)
+        f_n_mag = wp.max(-t_n, 0.0) * particle_area + c_n * wp.max(-v_n, 0.0)
         if f_n_mag <= 0.0:
             continue
         f_n = f_n_mag * n_w
 
-        # Coulomb friction, regularized by a damping-like cap to avoid chatter.
+        # Coulomb friction in the gravity-tangential direction (Z-up).
+        # Projects anti-gravity onto the contact tangent plane: provides a stable
+        # static-friction restoring force when v_sphere ≈ 0 and particle thermal
+        # velocities are isotropic (velocity-based direction averaged to zero).
         f_t = wp.vec3(0.0)
         if mu > 0.0:
-            v_t_norm = wp.length(v_t)
-            v_eff = wp.sqrt(v_t_norm * v_t_norm + _V_EPS * _V_EPS)
-            f_t = -(mu * f_n_mag / v_eff) * v_t
+            anti_g = wp.vec3(0.0, 0.0, 1.0)
+            g_tan = anti_g - wp.dot(anti_g, n_w) * n_w
+            g_tan_norm = wp.length(g_tan)
+            if g_tan_norm > _EPSILON:
+                f_t = -(mu * f_n_mag / g_tan_norm) * g_tan
 
         f_total = f_n + f_t
 
