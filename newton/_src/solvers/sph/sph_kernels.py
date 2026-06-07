@@ -20,6 +20,7 @@ import warp.fem as fem
 
 from ...geometry import ParticleFlags
 from .sph_dummy_boundary import (
+    SPH_DUMMY_EMBEDDED,
     SPH_FLUID,
     compute_virtual_stress,
     compute_virtual_velocity,
@@ -706,7 +707,13 @@ def make_compute_stress_force_kernel(has_dummies: bool):
                     sigma_j = stress[j]
                     rho_j = density[j]
                     if wp.static(has_dummies):
-                        if particle_type[j] != SPH_FLUID:
+                        if particle_type[j] == SPH_DUMMY_EMBEDDED:
+                            # Hu et al. (2021): kernel-interpolated stress (no hydrostatic
+                            # correction).  The caller must write the interpolated value
+                            # into ``stress[j]`` before launching this kernel.
+                            sigma_j = stress[j]
+                            rho_j = reference_density
+                        elif particle_type[j] != SPH_FLUID:
                             sigma_j = compute_virtual_stress(
                                 reference_density,
                                 gravity,
