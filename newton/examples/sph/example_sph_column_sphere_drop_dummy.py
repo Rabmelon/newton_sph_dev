@@ -19,7 +19,6 @@ alternative.
 from __future__ import annotations
 
 import argparse as _ap
-import copy
 import math
 
 import matplotlib.pyplot as plt
@@ -30,11 +29,9 @@ import newton
 import newton.examples
 from newton._src.geometry import ParticleFlags
 from newton._src.solvers.sph.sph_dummy_boundary import (
-    SPH_FLUID,
-    SPH_DUMMY_EMBEDDED,
     _SPH_DUMMY_EMBEDDED_VAL,
     _SPH_DUMMY_NOSLIP_VAL,
-    compute_virtual_velocity,
+    SPH_FLUID,
 )
 from newton._src.solvers.sph.sph_kernels import wendland_c2_3d, wendland_c2_grad_3d
 from newton.solvers import SolverSPH
@@ -47,9 +44,7 @@ _EPSILON = wp.constant(1.0e-8)
 _RHO_GRANULAR_C = wp.constant(RHO_GRANULAR)
 
 
-def _predict_penetration_depth(
-    mu_s: float, rho_s: float, rho_g: float, H: float, R: float, n_iter: int = 50
-) -> float:
+def _predict_penetration_depth(mu_s: float, rho_s: float, rho_g: float, H: float, R: float, n_iter: int = 50) -> float:
     """Predicted sphere penetration depth into a granular bed [m].
 
     Iterative formula (50 steps from delta_0 = 0):
@@ -101,9 +96,9 @@ def _kernel_interpolate_embedded_stress(
     For each embedded dummy *d*, computes the kernel-weighted average of
     neighbouring fluid stresses:
 
-        σ_d = Σ_j V_j σ_j W(x_d − x_j) / Σ_j V_j W(x_d − x_j)
+        sigma_d = sum_j V_j sigma_j W(x_d - x_j) / sum_j V_j W(x_d - x_j)
 
-    where V_j = m_j / ρ_j is the particle volume.  No hydrostatic correction
+    where V_j = m_j / rho_j is the particle volume.  No hydrostatic correction
     is added — the embedded boundary inherits the local stress field of the
     granular material.
     """
@@ -348,7 +343,7 @@ def _generate_sphere_dummy_particles(
     # Outward radial unit normal from sphere centre.
     norm_all = pos_all - np.array([cx, cy, cz], dtype=np.float32)
     r = np.linalg.norm(norm_all, axis=1, keepdims=True)
-    mask = (r[:, 0] > 1e-12)
+    mask = r[:, 0] > 1e-12
     norm_all[mask] /= r[mask]
 
     types_all = np.full(n, ptype, dtype=np.int32)
@@ -401,9 +396,7 @@ class Example:
         SolverSPH.register_custom_attributes(builder)
 
         # 1. Emit granular particles (must be first for fluid contiguity)
-        self.fluid_count = self._emit_column_particles(
-            builder, self.particle_spacing, args.bed_depth
-        )
+        self.fluid_count = self._emit_column_particles(builder, self.particle_spacing, args.bed_depth)
 
         # 2. Wall dummy boundaries (bottom + 4 sides, no top)
         domain_lo = (-0.075, -0.075, 0.0)
@@ -430,9 +423,7 @@ class Example:
         if self.sphere_dummy_count > 0:
             dummy_vol = self.particle_spacing**3
             dummy_mass_val = args.sphere_density * dummy_vol
-            pos_list = [
-                tuple(float(v) for v in sphere_pos_np[i]) for i in range(self.sphere_dummy_count)
-            ]
+            pos_list = [tuple(float(v) for v in sphere_pos_np[i]) for i in range(self.sphere_dummy_count)]
             vel_list = [(0.0, 0.0, 0.0)] * self.sphere_dummy_count
             mass_list = [dummy_mass_val] * self.sphere_dummy_count
             radius_list = [self.particle_spacing / 2.0] * self.sphere_dummy_count
@@ -444,8 +435,7 @@ class Example:
                 custom_attributes={
                     "sph:particle_type": sphere_type_np.tolist(),
                     "sph:wall_normal": [
-                        tuple(float(v) for v in sphere_norm_np[i])
-                        for i in range(self.sphere_dummy_count)
+                        tuple(float(v) for v in sphere_norm_np[i]) for i in range(self.sphere_dummy_count)
                     ],
                 },
             )
@@ -456,9 +446,7 @@ class Example:
 
         if self.sphere_dummy_count > 0:
             m_np = self.model.particle_mass.numpy()
-            m_dummy_total = float(
-                m_np[self.sphere_dummy_start : self.sphere_dummy_end].sum()
-            )
+            m_dummy_total = float(m_np[self.sphere_dummy_start : self.sphere_dummy_end].sum())
             dummy_vol = self.particle_spacing**3
             dummy_mass_per = args.sphere_density * dummy_vol
             print(
@@ -469,7 +457,7 @@ class Example:
                 f"m_theoretical={self._sphere_mass:.6f} kg "
                 f"ratio={m_dummy_total / self._sphere_mass:.4f} "
                 f"V_disc={self.sphere_dummy_count * dummy_vol * 1e9:.2f} mm^3 "
-                f"V_sphere={4.0/3.0 * math.pi * sphere_radius**3 * 1e9:.2f} mm^3"
+                f"V_sphere={4.0 / 3.0 * math.pi * sphere_radius**3 * 1e9:.2f} mm^3"
             )
 
         # ---- SPH solver configuration ----
@@ -487,15 +475,13 @@ class Example:
         # Hu 2021 §3.1: G_i corrected gradient is intrinsically unstable
         # without companion stabilisation (PPST or XSPH ≥ 0.3); enable XSPH
         # automatically whenever the corrected gradient is selected.
-        cfg.xsph_epsilon = args.xsph_epsilon if args.xsph_epsilon is not None else (
-            0.5 if args.use_consistent_discretization else 0.0
+        cfg.xsph_epsilon = (
+            args.xsph_epsilon if args.xsph_epsilon is not None else (0.5 if args.use_consistent_discretization else 0.0)
         )
         cfg.ppst_enabled = getattr(args, "ppst", False)
 
         material_friction = (
-            args.material_friction
-            if args.material_friction is not None
-            else math.atan(args.sphere_friction)
+            args.material_friction if args.material_friction is not None else math.atan(args.sphere_friction)
         )
         self.model.sph.young_modulus.fill_(args.young_modulus)
         self.model.sph.poisson_ratio.fill_(0.3)
@@ -514,16 +500,12 @@ class Example:
         # fast update during simulation.
         if self.sphere_dummy_count > 0:
             q_np = self.state_0.particle_q.numpy().copy()
-            self._sphere_dummy_init_pos = q_np[
-                self.sphere_dummy_start : self.sphere_dummy_end
-            ].copy()
+            self._sphere_dummy_init_pos = q_np[self.sphere_dummy_start : self.sphere_dummy_end].copy()
         else:
             self._sphere_dummy_init_pos = np.zeros((0, 3), dtype=np.float32)
 
         # ---- Hu 2021 embedded-dummy scratch ----
-        self._embedded_stress = wp.zeros(
-            self.sphere_dummy_count, dtype=wp.mat33, device=self.model.device
-        )
+        self._embedded_stress = wp.zeros(self.sphere_dummy_count, dtype=wp.mat33, device=self.model.device)
         self._sphere_force = wp.zeros(1, dtype=wp.vec3, device=self.model.device)
         self._reaction_grid = wp.HashGrid(128, 128, 128)
 
@@ -572,7 +554,6 @@ class Example:
         """Translate sphere dummy particles vertically by ``delta_z`` and set velocity."""
         if self.sphere_dummy_count == 0:
             return
-        n = self.sphere_dummy_count
         new_pos = self._sphere_dummy_init_pos + np.array(
             [0.0, 0.0, self._sphere_z - self._sphere_start_z], dtype=np.float32
         )
@@ -581,9 +562,7 @@ class Example:
         state.particle_q.assign(q_np)
 
         qd_np = state.particle_qd.numpy()
-        qd_np[self.sphere_dummy_start : self.sphere_dummy_end] = np.array(
-            [0.0, 0.0, vz], dtype=np.float32
-        )
+        qd_np[self.sphere_dummy_start : self.sphere_dummy_end] = np.array([0.0, 0.0, vz], dtype=np.float32)
         state.particle_qd.assign(qd_np)
 
     def _prepare_embedded_stress(self) -> None:
@@ -831,12 +810,8 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument("--fps", type=float, default=60.0)
-        parser.add_argument(
-            "--duration", type=float, default=0.8, help="Simulation duration [s]"
-        )
-        parser.add_argument(
-            "--sphere-radius", type=float, default=0.0125, help="Sphere radius [m]"
-        )
+        parser.add_argument("--duration", type=float, default=0.8, help="Simulation duration [s]")
+        parser.add_argument("--sphere-radius", type=float, default=0.0125, help="Sphere radius [m]")
         parser.add_argument(
             "--sphere-density",
             type=float,
@@ -939,17 +914,10 @@ if __name__ == "__main__":
         SPHERE_RADIUS = 0.0125
 
         wp.config.quiet = True
-        combos = [
-            (H, rho, mu)
-            for H in BALL_DROP_HEIGHTS
-            for rho in BALL_DENSITIES
-            for mu in MU_S_VALUES
-        ]
+        combos = [(H, rho, mu) for H in BALL_DROP_HEIGHTS for rho in BALL_DENSITIES for mu in MU_S_VALUES]
         rows = []
         for i, (H, rho_s, mu_s) in enumerate(combos, 1):
-            print(
-                f"\n[{i}/{len(combos)}] H={H}m  rho_s={rho_s}  mu_s={mu_s}", flush=True
-            )
+            print(f"\n[{i}/{len(combos)}] H={H}m  rho_s={rho_s}  mu_s={mu_s}", flush=True)
             sweep_args = _ap.Namespace(
                 fps=60.0,
                 duration=args.duration,
@@ -961,12 +929,8 @@ if __name__ == "__main__":
                 plot_path=f"/tmp/sph_dummy_sweep_{i}.png",
                 device=args.device,
                 test=False,
-                artificial_viscosity_alpha=getattr(
-                    args, "artificial_viscosity_alpha", 0.1
-                ),
-                use_consistent_discretization=getattr(
-                    args, "use_consistent_discretization", False
-                ),
+                artificial_viscosity_alpha=getattr(args, "artificial_viscosity_alpha", 0.1),
+                use_consistent_discretization=getattr(args, "use_consistent_discretization", False),
                 xsph_epsilon=getattr(args, "xsph_epsilon", None),
                 bed_depth=getattr(args, "bed_depth", 0.05),
                 young_modulus=getattr(args, "young_modulus", 1.0e6),
@@ -979,27 +943,19 @@ if __name__ == "__main__":
                 ex.step()
 
             delta_sim = ex._telemetry[-1]["pen"]
-            delta_pred = _predict_penetration_depth(
-                mu_s, rho_s, RHO_GRANULAR, H, SPHERE_RADIUS
-            )
+            delta_pred = _predict_penetration_depth(mu_s, rho_s, RHO_GRANULAR, H, SPHERE_RADIUS)
             err_pct = 100.0 * abs(delta_sim - delta_pred) / max(delta_pred, 1e-6)
             rows.append((H, rho_s, mu_s, delta_sim * 1e3, delta_pred * 1e3, err_pct))
-            print(
-                f"  sim={delta_sim * 1e3:.2f}mm  pred={delta_pred * 1e3:.2f}mm  err={err_pct:.1f}%"
-            )
+            print(f"  sim={delta_sim * 1e3:.2f}mm  pred={delta_pred * 1e3:.2f}mm  err={err_pct:.1f}%")
             del ex
 
-        hdr = (
-            f"{'H[m]':>6} {'rho_s':>6} {'mu_s':>5} {'sim[mm]':>9} {'pred[mm]':>9} {'err%':>7}"
-        )
+        hdr = f"{'H[m]':>6} {'rho_s':>6} {'mu_s':>5} {'sim[mm]':>9} {'pred[mm]':>9} {'err%':>7}"
         sep = "-" * len(hdr)
         print("\n" + "=" * len(hdr))
         print(hdr)
         print(sep)
         for H, rho_s, mu_s, sim_mm, pred_mm, err_pct in rows:
-            print(
-                f"{H:>6.2f} {rho_s:>6} {mu_s:>5.1f} {sim_mm:>9.2f} {pred_mm:>9.2f} {err_pct:>7.1f}%"
-            )
+            print(f"{H:>6.2f} {rho_s:>6} {mu_s:>5.1f} {sim_mm:>9.2f} {pred_mm:>9.2f} {err_pct:>7.1f}%")
         print("=" * len(hdr))
     else:
         example = Example(viewer, args)

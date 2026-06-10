@@ -53,8 +53,8 @@ from .sph_kernels import (
     integrate_symplectic_euler_kernel,
     integrate_verlet_final_kernel,
     make_compute_artificial_viscosity_kernel,
-    make_compute_density_kernel,
     make_compute_correction_matrix_kernel,
+    make_compute_density_kernel,
     make_compute_stress_force_kernel,
     make_compute_velocity_gradient_kernel,
     make_xsph_correction_kernel,
@@ -369,12 +369,8 @@ class SolverSPH(SolverBase):
         self._has_dummies = bool(np.any(pt != 0))
         self._use_consistent = config.use_consistent_discretization
         self._density_kernel = make_compute_density_kernel(self._has_dummies)
-        self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(
-            self._has_dummies, self._use_consistent
-        )
-        self._stress_force_kernel = make_compute_stress_force_kernel(
-            self._has_dummies, self._use_consistent
-        )
+        self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(self._has_dummies, self._use_consistent)
+        self._stress_force_kernel = make_compute_stress_force_kernel(self._has_dummies, self._use_consistent)
         self._artificial_viscosity_kernel = make_compute_artificial_viscosity_kernel(self._has_dummies)
         self._xsph_kernel = make_xsph_correction_kernel(self._has_dummies)
 
