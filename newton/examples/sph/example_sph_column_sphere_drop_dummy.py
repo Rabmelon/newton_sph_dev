@@ -488,6 +488,7 @@ class Example:
         cfg.xsph_epsilon = args.xsph_epsilon if args.xsph_epsilon is not None else (
             0.5 if args.use_consistent_discretization else 0.0
         )
+        cfg.ppst_enabled = getattr(args, "ppst", False)
 
         material_friction = (
             args.material_friction
@@ -887,6 +888,11 @@ class Example:
             "--no-sphere-feedback",
             action="store_true",
             help="Disable SPH→sphere reaction force (diagnostic: free-fall only)",
+        )
+        parser.add_argument(
+            "--ppst",
+            action="store_true",
+            help="Enable Hu 2021 PPST penetration-based particle shifting",
         )
         parser.add_argument(
             "--xsph-epsilon",

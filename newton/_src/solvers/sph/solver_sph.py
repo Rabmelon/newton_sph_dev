@@ -46,6 +46,8 @@ from .sph_constitutive import (
 )
 from .sph_dummy_boundary import add_dummy_particles_to_builder
 from .sph_kernels import (
+    apply_ppst_shift_kernel,
+    compute_ppst_shift_kernel,
     compute_strain_rate_kernel,
     half_step_position_kernel,
     integrate_symplectic_euler_kernel,
@@ -123,6 +125,28 @@ class SolverSPH(SolverBase):
         # --- Corrections ---
         xsph_epsilon: float = 0.0
         """XSPH velocity smoothing factor (0 = off, 1 = full)."""
+        ppst_enabled: bool = False
+        """Hu et al. (2021) CMAME penetration-based particle shifting (PPST, Eq. 16).
+
+        When True, fluid particle positions are shifted at the end of each
+        substep to enforce particle regularity, with a 2nd-order velocity
+        correction ``u += grad(u) @ shift``. Free-surface safe: the shift is
+        proportional to ``|u| dt`` and the negative-penetration pull is capped
+        by ``ppst_delta_r0``, so no free-surface particle tracking is needed.
+        """
+        ppst_beta_1: float = 3.0
+        """PPST push coefficient for overlapping pairs (Hu 2021: 3.0)."""
+        ppst_beta_2: float = 1.0
+        """PPST pull coefficient for separated pairs (Hu 2021: 1.0)."""
+        ppst_delta_r0: float = -0.1
+        """PPST lower cap on dimensionless negative penetration (Hu 2021: -0.1)."""
+        ppst_velocity_correction: float = 0.0
+        """Scale of the 2nd-order PPST velocity correction ``u += c * grad(u) @ shift``.
+
+        0 (default) shifts positions only. The full correction (1.0) follows
+        Hu 2021 but can feed back unstably through sharp shear bands at
+        impact fronts; enable with care.
+        """
         use_consistent_discretization: bool = False
         """Hu et al. (2021) CMAME first-order-consistent gradient correction.
 
@@ -362,6 +386,12 @@ class SolverSPH(SolverBase):
             self._correction_matrix_kernel = None
             self._correction_matrix = None
 
+        # Hu 2021 PPST scratch (only when particle shifting is enabled)
+        if config.ppst_enabled:
+            self._ppst_shift = wp.zeros(n, dtype=wp.vec3, device=model.device)
+        else:
+            self._ppst_shift = None
+
     def _extract_gravity_vec(self) -> wp.vec3:
         """Extract gravity as a :class:`wp.vec3` from the model array."""
         g = self.model.gravity.numpy()
@@ -528,6 +558,15 @@ class SolverSPH(SolverBase):
         if self._config.xsph_epsilon > 0.0:
             self._xsph_correction(state_out)
 
+        # 10b. Hu 2021 PPST particle shifting (positions/velocities in-place)
+        if self._config.ppst_enabled:
+            self._apply_ppst(
+                state_out,
+                dt,
+                density=state_in.sph.density,
+                velocity_gradient=state_in.sph.velocity_gradient,
+            )
+
         # 11. Copy density to state_out for continuity across steps
         wp.copy(state_out.sph.density, state_in.sph.density)
 
@@ -616,6 +655,10 @@ class SolverSPH(SolverBase):
         # 10. XSPH velocity correction (uses midpoint hash grid)
         if self._config.xsph_epsilon > 0.0:
             self._xsph_correction(state_out)
+
+        # 10b. Hu 2021 PPST particle shifting (positions/velocities in-place)
+        if self._config.ppst_enabled:
+            self._apply_ppst(state_out, dt)
 
         # Density was computed directly into state_out in step 3 — no copy needed.
 
@@ -1109,6 +1152,65 @@ class SolverSPH(SolverBase):
                 self._config.reference_density,
             ],
             outputs=[state.particle_qd],
+            device=self.model.device,
+        )
+
+    def _apply_ppst(
+        self,
+        state: newton.State,
+        dt: float,
+        density: wp.array | None = None,
+        velocity_gradient: wp.array | None = None,
+    ) -> None:
+        """Hu 2021 PPST: shift fluid positions and velocities in-place.
+
+        Queries the hash grid built earlier in the step. Positions have
+        moved at most ``|u| dt`` since the build, which is well inside the
+        support-radius slack for this regularisation term.
+
+        Args:
+            state: State whose ``particle_q`` / ``particle_qd`` are shifted.
+            dt: Substep size [s].
+            density: Density array to derive the fictitious sphere diameter
+                from. Defaults to ``state.sph.density``.
+            velocity_gradient: Velocity-gradient array for the 2nd-order
+                velocity correction. Defaults to ``state.sph.velocity_gradient``.
+        """
+        rho = density if density is not None else state.sph.density
+        grad_v = velocity_gradient if velocity_gradient is not None else state.sph.velocity_gradient
+        wp.launch(
+            compute_ppst_shift_kernel,
+            dim=self._fluid_count,
+            inputs=[
+                self._hash_grid.id,
+                state.particle_q,
+                state.particle_qd,
+                self.model.particle_mass,
+                rho,
+                self.model.particle_flags,
+                self._particle_type,
+                self._support_radius,
+                self._config.reference_density,
+                dt,
+                self._config.ppst_beta_1,
+                self._config.ppst_beta_2,
+                self._config.ppst_delta_r0,
+                0.2 * self._h,
+            ],
+            outputs=[self._ppst_shift],
+            device=self.model.device,
+        )
+        wp.launch(
+            apply_ppst_shift_kernel,
+            dim=self._fluid_count,
+            inputs=[
+                self._ppst_shift,
+                grad_v,
+                self.model.particle_flags,
+                self._particle_type,
+                self._config.ppst_velocity_correction,
+            ],
+            outputs=[state.particle_q, state.particle_qd],
             device=self.model.device,
         )
 

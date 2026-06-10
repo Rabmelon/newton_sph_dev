@@ -1101,3 +1101,127 @@ def make_xsph_correction_kernel(has_dummies: bool):
         vel_out[i] = vi + epsilon * correction
 
     return xsph_correction_kernel_impl
+
+
+# ---------------------------------------------------------------------------
+# PPST — penetration-based particle shifting (Hu et al. 2021, Eq. 16)
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def compute_ppst_shift_kernel(
+    grid: wp.uint64,
+    pos: wp.array[wp.vec3],
+    vel: wp.array[wp.vec3],
+    mass: wp.array[float],
+    density: wp.array[float],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
+    support_radius: float,
+    reference_density: float,
+    dt: float,
+    beta_1: float,
+    beta_2: float,
+    delta_r0: float,
+    max_shift: float,
+    shift: wp.array[wp.vec3],
+):
+    """Penetration-based particle shifting vector (Hu et al. 2021, Eq. 16).
+
+    Attaches a fictitious sphere of diameter ``D_s,i = 2*cbrt(3 m_i/(4 pi rho_i))``
+    to each fluid particle and accumulates per-pair contributions based on the
+    dimensionless penetration ``delta_r_ij = (D_s,i - r_ij) / D_s,i``:
+
+    - ``delta_r_ij > 0``  (overlap):       ``beta_1 * delta_r_ij * e_ij`` (push apart)
+    - ``delta_r0 < delta_r_ij <= 0``:      ``beta_2 * delta_r_ij * e_ij`` (mild pull)
+    - ``delta_r_ij <= delta_r0``:          ``beta_2 * delta_r0  * e_ij`` (capped pull)
+
+    The total shift is scaled by ``|u_i| * dt`` so stationary particles do not
+    move. Dummy neighbors participate in the sum (their fictitious diameter
+    is taken from particle *i*), which stops fluid pile-up against moving
+    boundaries.
+
+    Hu 2021 reports that with ``beta_1 = 3, beta_2 = 1`` the shift magnitude
+    stays below 5% of the per-step displacement ``|u_i| dt``. That holds for
+    near-uniform flows where pair contributions largely cancel; at impact
+    fronts the contributions align and the raw sum violates the bound, so the
+    5% ratio is enforced here as a hard clamp (plus the absolute ``max_shift``
+    guard against clamped-velocity outliers).
+    """
+    i = wp.tid()
+    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if particle_type[i] != SPH_FLUID:
+        shift[i] = wp.vec3(0.0)
+        return
+
+    rho_i = density[i]
+    if rho_i < _EPSILON:
+        shift[i] = wp.vec3(0.0)
+        return
+
+    # Fictitious sphere diameter from particle mass and current density.
+    d_s = 2.0 * wp.cbrt(3.0 * mass[i] / (4.0 * _PI * rho_i))
+    if d_s < _EPSILON:
+        shift[i] = wp.vec3(0.0)
+        return
+
+    xi = pos[i]
+    acc = wp.vec3(0.0)
+
+    query = wp.hash_grid_query(grid, xi, support_radius)
+    j = int(0)
+    while wp.hash_grid_query_next(query, j):
+        if (particle_flags[j] & ParticleFlags.ACTIVE) != 0 and j != i:
+            r_vec = xi - pos[j]
+            r = wp.length(r_vec)
+            if r < support_radius and r > _EPSILON:
+                e_ij = r_vec / r
+                delta_r = (d_s - r) / d_s
+                if delta_r > 0.0:
+                    acc += beta_1 * delta_r * e_ij
+                elif delta_r > delta_r0:
+                    acc += beta_2 * delta_r * e_ij
+                else:
+                    acc += beta_2 * delta_r0 * e_ij
+
+    u_dt = wp.length(vel[i]) * dt
+    s = u_dt * acc
+    s_len = wp.length(s)
+    # Hu 2021 invariant: shift no larger than 5% of the step displacement.
+    s_max = wp.min(0.05 * u_dt, max_shift)
+    if s_len > s_max and s_len > _EPSILON:
+        s = s * (s_max / s_len)
+    shift[i] = s
+
+
+@wp.kernel
+def apply_ppst_shift_kernel(
+    shift: wp.array[wp.vec3],
+    velocity_gradient: wp.array[wp.mat33],
+    particle_flags: wp.array[wp.int32],
+    particle_type: wp.array[wp.int32],
+    velocity_correction: float,
+    pos_out: wp.array[wp.vec3],
+    vel_out: wp.array[wp.vec3],
+):
+    """Apply the PPST shift to positions with 2nd-order velocity correction.
+
+    ``x_i += delta_r_i`` and ``u_i += c * L_i @ delta_r_i`` where ``L = grad(u)``
+    is the SPH velocity gradient (Taylor expansion of the velocity field at
+    the shifted location) and ``c = velocity_correction`` scales the update
+    (0 disables it; near sharp shear bands the full correction can couple
+    with the shift into a positive feedback loop). Density is not updated
+    here: the next substep's Shepard-corrected density summation re-evaluates
+    it from the shifted positions.
+    """
+    i = wp.tid()
+    if (particle_flags[i] & ParticleFlags.ACTIVE) == 0:
+        return
+    if particle_type[i] != SPH_FLUID:
+        return
+
+    s = shift[i]
+    pos_out[i] = pos_out[i] + s
+    if velocity_correction > 0.0:
+        vel_out[i] = vel_out[i] + velocity_correction * (velocity_gradient[i] @ s)
