@@ -371,7 +371,7 @@ class Example:
         self.sim_time = 0.0
         self.sim_duration = args.duration
 
-        self.particle_spacing = 0.002
+        self.particle_spacing = args.particle_spacing
         kh = 1.3
         sound_speed = 50.0
         h = kh * self.particle_spacing
@@ -382,7 +382,7 @@ class Example:
         self._h = h
         self._support_radius = 2.0 * h  # kh=1.3 → factor=2.0 (default)
 
-        self._column_top = 0.05
+        self._column_top = args.bed_depth
         sphere_radius = args.sphere_radius
         _surface_gap = 5e-4
         drop_z = self._column_top + sphere_radius + _surface_gap
@@ -401,11 +401,13 @@ class Example:
         SolverSPH.register_custom_attributes(builder)
 
         # 1. Emit granular particles (must be first for fluid contiguity)
-        self.fluid_count = self._emit_column_particles(builder, self.particle_spacing)
+        self.fluid_count = self._emit_column_particles(
+            builder, self.particle_spacing, args.bed_depth
+        )
 
         # 2. Wall dummy boundaries (bottom + 4 sides, no top)
         domain_lo = (-0.075, -0.075, 0.0)
-        domain_hi = (0.075, 0.075, 0.10)
+        domain_hi = (0.075, 0.075, args.bed_depth + 0.05)
         self.wall_dummy_count = SolverSPH.add_dummy_particles(
             builder,
             bounds_lo=domain_lo,
@@ -495,7 +497,7 @@ class Example:
             if args.material_friction is not None
             else math.atan(args.sphere_friction)
         )
-        self.model.sph.young_modulus.fill_(1.0e6)
+        self.model.sph.young_modulus.fill_(args.young_modulus)
         self.model.sph.poisson_ratio.fill_(0.3)
         self.model.sph.friction.fill_(material_friction)
         self.model.sph.cohesion.fill_(0.0)
@@ -539,14 +541,14 @@ class Example:
         self._plot_generated = False
 
     @staticmethod
-    def _emit_column_particles(builder: newton.ModelBuilder, dx: float) -> int:
+    def _emit_column_particles(builder: newton.ModelBuilder, dx: float, bed_depth: float) -> int:
         """Emit the granular column particles (same as original)."""
         density = RHO_GRANULAR
         volume = dx**3
         mass = density * volume
 
         lo = np.array([-0.075, -0.075, 0.0], dtype=np.float32)
-        hi = np.array([0.075, 0.075, 0.05], dtype=np.float32)
+        hi = np.array([0.075, 0.075, bed_depth], dtype=np.float32)
         xs = np.arange(lo[0] + 0.5 * dx, hi[0], dx, dtype=np.float32)
         ys = np.arange(lo[1] + 0.5 * dx, hi[1], dx, dtype=np.float32)
         zs = np.arange(lo[2] + 0.5 * dx, hi[2], dx, dtype=np.float32)
@@ -895,6 +897,25 @@ class Example:
             help="Enable Hu 2021 PPST penetration-based particle shifting",
         )
         parser.add_argument(
+            "--bed-depth",
+            type=float,
+            default=0.05,
+            help="Granular bed depth [m] (analytical formula assumes a deep bed)",
+        )
+        parser.add_argument(
+            "--particle-spacing",
+            "-dx",
+            type=float,
+            default=0.002,
+            help="SPH particle spacing dx [m] (Hu 2021: 0.001)",
+        )
+        parser.add_argument(
+            "--young-modulus",
+            type=float,
+            default=1.0e6,
+            help="Granular Young's modulus [Pa] (Hu 2021: 2e6)",
+        )
+        parser.add_argument(
             "--xsph-epsilon",
             type=float,
             default=None,
@@ -947,6 +968,10 @@ if __name__ == "__main__":
                     args, "use_consistent_discretization", False
                 ),
                 xsph_epsilon=getattr(args, "xsph_epsilon", None),
+                bed_depth=getattr(args, "bed_depth", 0.05),
+                young_modulus=getattr(args, "young_modulus", 1.0e6),
+                ppst=getattr(args, "ppst", False),
+                particle_spacing=getattr(args, "particle_spacing", 0.002),
             )
             sweep_viewer = ViewerNull(num_frames=10000)
             ex = Example(sweep_viewer, sweep_args)
