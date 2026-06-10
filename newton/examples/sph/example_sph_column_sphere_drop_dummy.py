@@ -489,9 +489,14 @@ class Example:
             0.5 if args.use_consistent_discretization else 0.0
         )
 
+        material_friction = (
+            args.material_friction
+            if args.material_friction is not None
+            else math.atan(args.sphere_friction)
+        )
         self.model.sph.young_modulus.fill_(1.0e6)
         self.model.sph.poisson_ratio.fill_(0.3)
-        self.model.sph.friction.fill_(args.material_friction)
+        self.model.sph.friction.fill_(material_friction)
         self.model.sph.cohesion.fill_(0.0)
         self.model.sph.viscosity.fill_(0.0)
 
@@ -856,8 +861,11 @@ class Example:
         parser.add_argument(
             "--material-friction",
             type=float,
-            default=0.5,
-            help="Granular material friction angle [rad] [default: 0.5]",
+            default=None,
+            help=(
+                "Granular material friction angle [rad]. Default: atan(sphere "
+                "friction mu_s), matching Hu 2021's DP calibration phi=atan(mu_s)."
+            ),
         )
         parser.add_argument(
             "--artificial-viscosity-alpha",
@@ -921,7 +929,7 @@ if __name__ == "__main__":
                 sphere_radius=SPHERE_RADIUS,
                 sphere_density=rho_s,
                 sphere_friction=mu_s,
-                material_friction=0.5,
+                material_friction=None,
                 drop_height=H,
                 plot_path=f"/tmp/sph_dummy_sweep_{i}.png",
                 device=args.device,
