@@ -302,72 +302,56 @@ def _generate_sphere_dummy_particles(
     center: tuple[float, float, float],
     radius: float,
     dx: float,
-    h: float,
     slip_type: str = "noslip",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Generate layered dummy particles on concentric spherical shells.
+    """Generate volume-filling dummy particles inside a sphere at ``dx`` spacing.
 
-    Uses Fibonacci sphere sampling for uniform point distribution on each shell.
-    Layer thickness is ``2h`` with ``ceil(2h / dx)`` layers, matching the AABB
-    dummy boundary convention.
+    Particles fill the sphere interior on a regular grid. Each particle
+    represents a volume ``dx^3``; mass is assigned as ``rho_sphere * dx^3``
+    at the call site so total discretised mass approximates the physical
+    sphere mass.
 
     Args:
         center: Sphere center [m].
         radius: Sphere radius [m].
         dx: Particle spacing [m].
-        h: Smoothing length [m].
         slip_type: ``'noslip'`` or ``'freeslip'``.
 
     Returns:
         Tuple of (positions [N,3], normals [N,3], types [N]).
     """
     cx, cy, cz = center
-    thickness = 2.0 * h
-    layer_count = max(1, int(math.ceil(thickness / dx)))
     ptype = _SPH_DUMMY_NOSLIP_VAL if slip_type == "noslip" else _SPH_DUMMY_FREESLIP_VAL
 
-    positions: list[np.ndarray] = []
-    normals: list[np.ndarray] = []
+    n_1d = int(math.ceil(2.0 * radius / dx))
+    positions: list[tuple[float, float, float]] = []
 
-    golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+    for ix in range(n_1d + 1):
+        x = cx - radius + ix * dx
+        for iy in range(n_1d + 1):
+            y = cy - radius + iy * dx
+            for iz in range(n_1d + 1):
+                z = cz - radius + iz * dx
+                dist_sq = (x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2
+                if dist_sq <= radius * radius:
+                    positions.append((float(x), float(y), float(z)))
 
-    for layer in range(1, layer_count + 1):
-        r_layer = radius + float(layer) * dx
-        area = 4.0 * math.pi * r_layer * r_layer
-        n_pts = max(1, int(math.ceil(area / (dx * dx))))
-
-        layer_pos = np.zeros((n_pts, 3), dtype=np.float32)
-        layer_norm = np.zeros((n_pts, 3), dtype=np.float32)
-
-        for k in range(n_pts):
-            # Fibonacci sphere: map k to unit sphere point
-            y = 1.0 - (float(k) / float(n_pts - 1)) * 2.0 if n_pts > 1 else 0.0
-            radius_xy = math.sqrt(max(0.0, 1.0 - y * y))
-            theta = golden_angle * float(k)
-            nx = math.cos(theta) * radius_xy
-            nz = math.sin(theta) * radius_xy
-            ny = y
-
-            layer_pos[k, 0] = cx + nx * r_layer
-            layer_pos[k, 1] = cy + ny * r_layer
-            layer_pos[k, 2] = cz + nz * r_layer
-            layer_norm[k, 0] = nx
-            layer_norm[k, 1] = ny
-            layer_norm[k, 2] = nz
-
-        positions.append(layer_pos)
-        normals.append(layer_norm)
-
-    if not positions:
+    n = len(positions)
+    if n == 0:
         return (
             np.zeros((0, 3), dtype=np.float32),
             np.zeros((0, 3), dtype=np.float32),
             np.zeros(0, dtype=np.int32),
         )
 
-    pos_all = np.concatenate(positions, axis=0)
-    norm_all = np.concatenate(normals, axis=0)
-    types_all = np.full(pos_all.shape[0], ptype, dtype=np.int32)
+    pos_all = np.array(positions, dtype=np.float32)
+    # Outward radial unit normal from sphere centre.
+    norm_all = pos_all - np.array([cx, cy, cz], dtype=np.float32)
+    r = np.linalg.norm(norm_all, axis=1, keepdims=True)
+    mask = (r[:, 0] > 1e-12)
+    norm_all[mask] /= r[mask]
+
+    types_all = np.full(n, ptype, dtype=np.int32)
     return pos_all, norm_all, types_all
 
 
@@ -435,7 +419,7 @@ class Example:
         # 3. Sphere dummy particles (after walls to preserve fluid contiguity)
         self.sphere_dummy_start = self.fluid_count + self.wall_dummy_count
         sphere_pos_np, sphere_norm_np, _sphere_type_ignored = _generate_sphere_dummy_particles(
-            sphere_center, sphere_radius, self.particle_spacing, h, slip_type="noslip"
+            sphere_center, sphere_radius, self.particle_spacing, slip_type="noslip"
         )
         sphere_type_np = np.full(sphere_pos_np.shape[0], _SPH_DUMMY_EMBEDDED_VAL, dtype=np.int32)
         self.sphere_dummy_count = sphere_pos_np.shape[0]
@@ -443,9 +427,7 @@ class Example:
 
         if self.sphere_dummy_count > 0:
             dummy_vol = self.particle_spacing**3
-            dummy_mass_val = (
-                self._sphere_mass / self.sphere_dummy_count
-            )  # total dummy mass == sphere physical mass
+            dummy_mass_val = args.sphere_density * dummy_vol
             pos_list = [
                 tuple(float(v) for v in sphere_pos_np[i]) for i in range(self.sphere_dummy_count)
             ]
@@ -475,12 +457,17 @@ class Example:
             m_dummy_total = float(
                 m_np[self.sphere_dummy_start : self.sphere_dummy_end].sum()
             )
+            dummy_vol = self.particle_spacing**3
+            dummy_mass_per = args.sphere_density * dummy_vol
             print(
-                f"[dummy-sphere] particles={self.sphere_dummy_count} "
-                f"m_per_dummy={m_dummy_total / self.sphere_dummy_count:.6e} kg "
+                f"[dummy-sphere] volume-fill particles={self.sphere_dummy_count} "
+                f"dx={self.particle_spacing:.4f} m "
+                f"m_per_dummy={dummy_mass_per:.6e} kg "
                 f"m_total={m_dummy_total:.6f} kg "
                 f"m_theoretical={self._sphere_mass:.6f} kg "
-                f"ratio={m_dummy_total / self._sphere_mass:.4f}"
+                f"ratio={m_dummy_total / self._sphere_mass:.4f} "
+                f"V_disc={self.sphere_dummy_count * dummy_vol * 1e9:.2f} mm^3 "
+                f"V_sphere={4.0/3.0 * math.pi * sphere_radius**3 * 1e9:.2f} mm^3"
             )
 
         # ---- SPH solver configuration ----
