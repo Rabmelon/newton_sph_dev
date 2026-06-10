@@ -381,7 +381,7 @@ class Example:
         )
         parser.add_argument("--plot-path", type=str, default=None)
         parser.add_argument("--sweep", action="store_true", help="Run parameter sweep over drop heights, densities, and frictions")
-        parser.add_argument("--material-friction", type=float, default=0.6, help="Granular material friction coefficient (tan phi) [default: 0.6]")
+        parser.add_argument("--material-friction", type=float, default=0.3, help="Granular material friction coefficient (tan phi) [default: 0.6]")
         parser.add_argument("--artificial-viscosity-alpha", type=float, default=0.1,
                             help="Monaghan artificial viscosity alpha coefficient [default: 0.1]")
         return parser

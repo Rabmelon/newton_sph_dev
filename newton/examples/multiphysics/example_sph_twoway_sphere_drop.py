@@ -637,9 +637,9 @@ class Example:
             default=0.0,
             help="Sand bed floor z (bottom) [m]. Negative = deeper bed below original floor.",
         )
-        parser.add_argument("--particle-spacing", "-dx", type=float, default=0.005, help="SPH particle spacing dx [m].")
+        parser.add_argument("--particle-spacing", "-dx", type=float, default=0.002, help="SPH particle spacing dx [m].")
         parser.add_argument("--kh", type=float, default=1.3, help="Smoothing length ratio h = kh * dx.")
-        parser.add_argument("--density", type=float, default=2500.0, help="Sand reference density [kg/m^3].")
+        parser.add_argument("--density", type=float, default=1510.0, help="Sand reference density [kg/m^3].")
         parser.add_argument("--sound-speed", type=float, default=50.0, help="Artificial sound speed for WCSPH [m/s].")
         parser.add_argument("--simulation-method", type=str, default="dp", choices=["dp", "mui"])
         parser.add_argument(
@@ -656,7 +656,7 @@ class Example:
         parser.add_argument("--viscosity", type=float, default=1.0e-3)
 
         # Sphere
-        parser.add_argument("--sphere-radius", type=float, default=0.05)
+        parser.add_argument("--sphere-radius", type=float, default=0.0125)
         parser.add_argument("--sphere-mass", type=float, default=1.0)
         parser.add_argument(
             "--drop-height",
