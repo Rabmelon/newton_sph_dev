@@ -931,6 +931,7 @@ if __name__ == "__main__":
                 test=False,
                 artificial_viscosity_alpha=getattr(args, "artificial_viscosity_alpha", 0.1),
                 use_consistent_discretization=getattr(args, "use_consistent_discretization", False),
+                use_hu_reaction=getattr(args, "use_hu_reaction", False),
                 xsph_epsilon=getattr(args, "xsph_epsilon", None),
                 bed_depth=getattr(args, "bed_depth", 0.05),
                 young_modulus=getattr(args, "young_modulus", 1.0e6),
