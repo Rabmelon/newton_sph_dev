@@ -56,8 +56,8 @@ class Example:
                 slip_type=args.dummy_slip_type,
             )
         else:
-            # Penalty boundary: use ground plane
-            builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+            # Penalty boundary: use ground plane with Coulomb friction
+            builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=args.ground_friction))
 
         self.model = builder.finalize()
         self.model.set_gravity(args.gravity)
@@ -214,6 +214,8 @@ class Example:
         parser.add_argument("--artificial-viscosity-alpha", type=float, default=0.1)
         parser.add_argument("--boundary-type", type=str, default="penalty", choices=["penalty", "dummy"])
         parser.add_argument("--penalty-stiffness", type=float, default=1.0e6)
+        parser.add_argument("--ground-friction", type=float, default=0.5,
+            help="Coulomb friction coefficient for the ground plane (penalty boundary).")
         parser.add_argument("--dummy-slip-type", type=str, default="noslip", choices=["noslip", "freeslip"])
 
         # Material

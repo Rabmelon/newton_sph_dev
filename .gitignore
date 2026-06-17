@@ -1,7 +1,12 @@
 # Rabmelon person settings
 .context_snapshot/
 bash.exe.stackdump
-
+*.Identifier
+.temp/
+temp/
+temp*/
+nouse*/
+nouse*
 
 # Python-generated files
 __pycache__/
@@ -78,3 +83,4 @@ docs/_static/viser/
 
 # Notebook checkpoints
 **/*.ipynb_checkpoints/
+.court/

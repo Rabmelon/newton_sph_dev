@@ -37,6 +37,7 @@ def ground_plane_penalty_kernel(
     plane_offset: float,
     ke: float,
     kd: float,
+    mu: float,
     # output (accumulated)
     accel: wp.array(dtype=wp.vec3),
 ):
@@ -46,6 +47,10 @@ def ground_plane_penalty_kernel(
     When d < 0 (penetrating), a restoring normal force and damping are applied:
 
         f_n = (ke * |d| - kd * v_n) * n
+
+    When ``mu > 0``, Coulomb friction opposes the tangential velocity:
+
+        f_t = -mu * |f_n| * (v_t / |v_t|)
 
     The force is divided by particle mass (handled externally) to produce
     acceleration.
@@ -58,6 +63,7 @@ def ground_plane_penalty_kernel(
         plane_offset: Plane offset (d in ax + by + cz + d = 0).
         ke: Penalty stiffness [N/m per unit mass -> m/s^2 per m penetration].
         kd: Penalty damping [N*s/m per unit mass].
+        mu: Coulomb friction coefficient (0 = frictionless).
         accel: Acceleration array (accumulated in-place).
     """
     i = wp.tid()
@@ -78,6 +84,13 @@ def ground_plane_penalty_kernel(
             f_mag = 0.0
         accel[i] = accel[i] + f_mag * plane_normal
 
+        # Tangential Coulomb friction
+        v_t = v - v_n * plane_normal
+        v_t_mag = wp.length(v_t)
+        if mu > 0.0 and v_t_mag > _EPSILON:
+            f_friction_mag = mu * f_mag
+            accel[i] = accel[i] - f_friction_mag * (v_t / v_t_mag)
+
 
 def apply_ground_plane_penalty(
     model: newton.Model,
@@ -89,7 +102,8 @@ def apply_ground_plane_penalty(
     """Apply ground-plane penalty forces for all plane shapes in the model.
 
     Iterates over model shapes and applies a penalty force for each shape
-    whose geometry type is ``GEO_PLANE``.
+    whose geometry type is ``GEO_PLANE``.  Each plane's Coulomb friction
+    coefficient is read from ``model.shape_material_mu``.
 
     Args:
         model: Newton model with shapes.
@@ -109,6 +123,7 @@ def apply_ground_plane_penalty(
 
     geo_types = model.shape_type.numpy()
     shape_transforms = model.shape_transform.numpy() if model.shape_count > 0 else None
+    shape_mus = model.shape_material_mu.numpy()
 
     for s in range(shape_count):
         if geo_types[s] == int(GeoType.PLANE):
@@ -128,6 +143,8 @@ def apply_ground_plane_penalty(
             # Plane offset: d = -dot(n, p) where p is a point on the plane
             plane_offset = -(normal[0] * px + normal[1] * py + normal[2] * pz)
 
+            mu = float(shape_mus[s])
+
             wp.launch(
                 ground_plane_penalty_kernel,
                 dim=n,
@@ -139,6 +156,7 @@ def apply_ground_plane_penalty(
                     plane_offset,
                     ke,
                     kd,
+                    mu,
                 ],
                 outputs=[accel],
                 device=model.device,

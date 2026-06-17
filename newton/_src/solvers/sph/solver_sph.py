@@ -296,11 +296,12 @@ class SolverSPH(SolverBase):
         g = self.model.gravity.numpy()
         return wp.vec3(float(g[0][0]), float(g[0][1]), float(g[0][2]))
 
-    def _extract_ground_planes(self) -> list[tuple[wp.vec3, float]]:
-        """Pre-compute ground plane normals and offsets from model shapes.
+    def _extract_ground_planes(self) -> list[tuple[wp.vec3, float, float]]:
+        """Pre-compute ground plane normals, offsets, and friction from model shapes.
 
         Reads shape geometry arrays once so that the hot loop can launch
-        penalty kernels without GPU→CPU synchronization.
+        penalty kernels without GPU->CPU synchronization.  The friction
+        coefficient ``mu`` is read from ``model.shape_material_mu``.
         """
         from ...geometry import GeoType
 
@@ -309,7 +310,8 @@ class SolverSPH(SolverBase):
             return []
         geo_types = model.shape_type.numpy()
         shape_transforms = model.shape_transform.numpy()
-        planes: list[tuple[wp.vec3, float]] = []
+        shape_mus = model.shape_material_mu.numpy()
+        planes: list[tuple[wp.vec3, float, float]] = []
         for s in range(model.shape_count):
             if geo_types[s] == int(GeoType.PLANE):
                 tf = shape_transforms[s]
@@ -318,7 +320,7 @@ class SolverSPH(SolverBase):
                 q = wp.quat(qx, qy, qz, qw)
                 normal = wp.quat_rotate(q, wp.vec3(0.0, 0.0, 1.0))
                 offset = -(normal[0] * px + normal[1] * py + normal[2] * pz)
-                planes.append((normal, float(offset)))
+                planes.append((normal, float(offset), float(shape_mus[s])))
         return planes
 
     @property
@@ -603,11 +605,11 @@ class SolverSPH(SolverBase):
     def _apply_boundary_forces(self, state: newton.State) -> None:
         """Apply cached ground plane penalty forces.
 
-        Uses pre-computed plane normals and offsets from :meth:`__init__`
-        to avoid GPU→CPU synchronization every substep.
+        Uses pre-computed plane normals, offsets, and friction coefficients
+        from :meth:`__init__` to avoid GPU->CPU synchronization every substep.
         """
         n = self.model.particle_count
-        for normal, offset in self._ground_planes:
+        for normal, offset, mu in self._ground_planes:
             wp.launch(
                 ground_plane_penalty_kernel,
                 dim=n,
@@ -619,6 +621,7 @@ class SolverSPH(SolverBase):
                     offset,
                     self._config.penalty_stiffness,
                     self._config.penalty_damping,
+                    mu,
                 ],
                 outputs=[self._accel],
                 device=self.model.device,

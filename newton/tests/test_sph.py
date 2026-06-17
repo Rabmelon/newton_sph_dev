@@ -328,6 +328,85 @@ def test_sand_cube_dummy_boundary(test, device):
     )
 
 
+def test_penalty_friction_reduces_runout(test, device):
+    """Coulomb friction on the ground plane should reduce lateral runout.
+
+    A thin slab of particles with lateral velocity falls onto the ground.
+    With friction (mu=1.0), lateral motion is damped; without (mu=0.0),
+    particles slide freely.  Internal (DP) friction is set to zero so
+    boundary friction is the dominant dissipation mechanism.
+    """
+
+    particles_per_cell = 3
+    particle_spacing = 0.05
+    kh = 1.3
+    sound_speed = 50.0
+    h = kh * particle_spacing
+    # CFL-stable time step
+    dt = 0.3 * h / sound_speed
+    n_steps = 400
+
+    density_ref = 2500.0
+    mass = density_ref * particle_spacing**3
+
+    # Thin slab: wide in XY, 2 layers in Z, starting just above ground
+    nx = 6 * particles_per_cell
+    ny = 6 * particles_per_cell
+    nz = 2 * particles_per_cell
+    lateral_vel = wp.vec3(1.0, 0.0, 0.0)
+
+    def _run_with_mu(mu_value: float) -> float:
+        builder = newton.ModelBuilder()
+        SolverSPH.register_custom_attributes(builder)
+
+        builder.add_particle_grid(
+            pos=wp.vec3(0.5 * particle_spacing, 0.5 * particle_spacing, 0.5 * particle_spacing),
+            rot=wp.quat_identity(),
+            vel=lateral_vel,
+            dim_x=nx,
+            dim_y=ny,
+            dim_z=nz,
+            cell_x=particle_spacing,
+            cell_y=particle_spacing,
+            cell_z=particle_spacing,
+            mass=mass,
+            jitter=0.0,
+            custom_attributes={"sph:friction": 0.0},
+        )
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=mu_value))
+
+        model = builder.finalize(device=device)
+
+        config = SolverSPH.Config()
+        config.particle_spacing = particle_spacing
+        config.kh = kh
+        config.sound_speed = sound_speed
+        config.reference_density = density_ref
+        config.xsph_epsilon = 0.0
+
+        state_0 = model.state()
+        state_1 = model.state()
+        solver = SolverSPH(model, config)
+
+        for _ in range(n_steps):
+            solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+            state_0, state_1 = state_1, state_0
+
+        pos = state_0.particle_q.numpy()
+        # Mean X displacement measures lateral runout
+        return float(np.mean(pos[:, 0]))
+
+    runout_no_friction = _run_with_mu(0.0)
+    runout_full_friction = _run_with_mu(1.0)
+
+    test.assertLess(
+        runout_full_friction,
+        runout_no_friction,
+        f"Friction should reduce lateral runout: mu=1.0 mean_x={runout_full_friction:.4f} "
+        f">= mu=0.0 mean_x={runout_no_friction:.4f}",
+    )
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -349,6 +428,13 @@ add_function_test(
 )
 add_function_test(
     TestSPH, "test_sand_cube_dummy_boundary", test_sand_cube_dummy_boundary, devices=devices, check_output=False
+)
+add_function_test(
+    TestSPH,
+    "test_penalty_friction_reduces_runout",
+    test_penalty_friction_reduces_runout,
+    devices=devices,
+    check_output=False,
 )
 
 
