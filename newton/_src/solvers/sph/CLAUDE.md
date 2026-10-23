@@ -366,6 +366,193 @@ Selected by `Config.simulation_method ∈ {"dp", "mui"}`.
 `σ_xx = σ_yy = K₀ σ_zz`, `K₀ = 1 − sin φ`.
 Z-up only. Skips non-fluid particles.
 
+## 10b. Body coupling — `sph_body_coupling.py`
+
+Two-way coupling between SPH fluid particles and rigid bodies driven
+by an external MBD solver (e.g. MuJoCo, Featherstone). Enabled by
+`Config.body_coupling_enabled` (default `False`).
+
+### Config
+
+| Field | Default | Unit | Meaning |
+|---|---|---|---|
+| `body_coupling_enabled` | `False` | — | Master switch. |
+| `body_coupling_damping` | `1.0` | N·s/m | Normal damping `c_n` (resists approach only, `max(0, -v·n)`). |
+| `body_coupling_friction` | `0.5` | — | Coulomb friction coefficient `μ`. |
+
+> **2026-05-28 — Akinci-style coupling.** The coupling now uses SPH
+> pressure at each penetrating fluid particle as the normal repulsion
+> force. Plasticity and yield come from the granular Drucker-Prager
+> constitutive model, not a tuned bearing-capacity knob.
+> Validated against an iterative penetration formula:
+> `δ = (0.14/μ_s)·√(ρ_s/ρ_g)·(2R)^(2/3)·(H+δ)^(1/3)` (50 iterations).
+> For canonical inputs (ρ_g=1510, ρ_s=2200, μ_s=0.3, H=0.1 m,
+> R=0.0125 m) the predicted penetration is **24.0 mm**.
+> SPH baseline (`test_sph`) unaffected.
+
+### Architecture
+
+SDF + Akinci-style SPH-pressure coupling per primitive shape (sphere /
+capsule along local +Z / axis-aligned box). For each fluid particle
+inside a body's SDF, the force depends on the SPH pressure at that
+particle and the sign of `v_n = (v_p − v_body)·n`:
+
+```
+Approach (v_n < 0):
+    F_n = (max(P_i, 0) * dx^2 + c_n * (-v_n)) n
+Separation (v_n >= 0):
+    F_n = 0                                       (no restoring spring)
+F_t = -min(μ |F_n|, m_p |v_t| / dt) v_t / |v_t|   (chatter-regularised Coulomb)
+```
+
+`P_i` is the Shepard-corrected SPH pressure (`State.sph.pressure`, Pa,
+positive in compression) at the penetrating fluid particle. Each particle
+covers area `dx^2`, so summing `P_i * dx^2` over all penetrating particles
+integrates the SPH pressure field over the contact surface. The asymmetric
+on/off law prevents elastic energy return on separation — a body dropped on
+the granular bed settles without bouncing elastically.
+
+Reaction `-F` is applied at the contact point and atomic-added into a
+per-body `wp.spatial_vector` accumulator (`Model.body_count`-sized).
+Layout matches Newton's `body_f`: `wp.spatial_vector(force_world,
+torque_world)` — `wp.spatial_top` = linear, `wp.spatial_bottom` =
+angular. The caller integrates the accumulator into `State.body_f`
+before the MBD step (see `newton/examples/mpm/example_mpm_twoway_coupling.py`
+for the wire-up pattern; the SPH example lives elsewhere — Phase 2c).
+
+The accumulator is exposed via ``SolverSPH.collect_body_wrench(state) ->
+wp.array[wp.spatial_vector] | None`` (matching MPM's
+``collect_collider_impulses(state)`` signature). **Reset is automatic:**
+``_apply_body_forces`` zeros the internal accumulator at the start of
+each call, and the result is stored on ``state_out._sph_body_wrench``
+at the end of each step path. The caller reads the wrench from the
+output state after each ``step()`` returns::
+
+    for _ in range(substeps):
+        # Apply previous substep's sand wrench to body_f
+        wrench = solver.collect_body_wrench(state_0)
+        if wrench is not None:
+            compute_body_forces(wrench, body_q, body_com, state_0.body_f)
+        # MBD step
+        mbd_solver.step(state_0, state_1, ...)
+        # SPH step (auto-resets and re-accumulates wrench internally)
+        sph_solver.step(state_0, state_1, ...)
+        state_0, state_1 = state_1, state_0
+
+The glue kernel ``compute_body_forces`` (in the example) converts the
+wrench to body forces — see
+``newton/examples/mpm/example_mpm_twoway_coupling.py`` for the reference
+pattern.
+
+### Collider table
+
+`build_body_collider(model, device)` walks `model.shape_*` once at
+solver init, keeping only shapes with `ShapeFlags.COLLIDE_PARTICLES`,
+`shape_body >= 0`, and primitive type ∈ `{SPHERE, CAPSULE, BOX}`.
+Mesh / plane / ellipsoid / hfield are warn-skipped (mesh-SDF is a
+Phase 2 feature). Rebuilt on
+`SolverNotifyFlags.SHAPE_PROPERTIES`.
+
+Shape parameter packing (from `model.shape_scale`):
+- Sphere: `(r, _, _)` — radius only.
+- Capsule: `(r, half_height, _)` — axis along local **+Z**.
+- Box: `(hx, hy, hz)` — half-extents.
+
+### Risks: mitigation status
+
+1. **Penalty CFL** — checked at init by `_check_penalty_cfl`; warns
+   if `k_n · dt_cfl² / m_p_min > 4` (explicit-Euler 1-DOF stability
+   bound).
+2. **NaN cascade** — kernel skips particles with non-positive or
+   non-finite density (`not (rho > 0.0)`) and clamps penetration to
+   `pen ≥ 0`. Stress is **not** zeroed here (out of scope; that's the
+   stress-update kernel's responsibility).
+3. **Body-pose freshness** — body pose is **frozen** during a single
+   `SolverSPH.step()` call (the kernel reads `body_q` once at launch).
+   The caller is responsible for refreshing the pose between substeps;
+   the sphere-drop example does this by co-stepping MBD at `sim_dt`
+   inside the SPH substep loop (see Fix B in
+   `example_sph_twoway_sphere_drop.py:step`). Without this, a body
+   moving at O(2.5 m/s) across an outer frame_dt = 20 ms presents a
+   step-function ~5 cm = ~10·dx intrusion to the first substep, which
+   the penalty kernel resolves as a slab-impulse → sand explodes.
+4. **First-contact elastic bounce** — **not** mitigated in the
+   solver. The penalty coupling ``F = k_n·pen + c_n·max(0,-v_n)`` is
+   purely elastic: the spring stores energy that returns to the body
+   on separation (damping only resists approach). The body always
+   bounces off the granular material. A plastic coupling scheme
+   (e.g. Akinci-style kernel interpolation where the DP return
+   mapping dissipates energy) is needed for true settling. MVP callers
+   should expect bounce dynamics; the current sphere-drop example logs
+   these bounces in telemetry.
+5. **Z-up assumption** — `_init_body_coupling` raises `ValueError` if
+   `model.up_axis != Axis.Z` (the SPH solver's geostatic init and
+   ground-plane extraction both assume Z-up).
+
+### Hooks in `SolverSPH.step()`
+
+After `_apply_boundary_forces`, before `_integrate`, both step paths
+launch `_apply_body_forces(...)` which zeros the internal accumulator,
+launches the coupling kernel, and then stores the result on
+``state_out._sph_body_wrench``. The Verlet path passes ``pos =
+self._pos_mid`` and ``vel = state_in.particle_qd`` and reads density
+from ``state_out.sph.density`` (the midpoint density, computed at step
+3 of ``_step_position_verlet``).
+
+### Known issues (2026-05-14)
+
+**A. Wrench reset semantics — FIXED (2026-05-14, refactored 2026-05-17).**
+   ``_apply_body_forces`` zeros ``_body_f_sand`` at the start of each call
+   and the result is stored on ``state_out._sph_body_wrench`` at the end
+   of each step path.  ``collect_body_wrench(state)`` reads from state
+   (matching MPM's ``collect_collider_impulses(state)``).  The explicit
+   ``reset_wrench_accumulator()`` method has been removed.
+
+**B. Body pose frozen across substep loop — FIXED (2026-05-14) in the
+   sphere-drop example via option (b)**: MBD runs at `sim_dt` inside
+   the SPH substep loop, so the body pose advances by at most
+   `v · sim_dt` (~5 μm at 2.5 m/s and `sim_dt = 40 μs`) between SPH
+   evaluations. The slab-impulse pathology is gone: max total KE
+   dropped from ~5870 J (Cycle 0, `k_n=1e5`) → 22 J after Fix B;
+   particle leak from 23 → 0. Note: `SolverSemiImplicit` co-stepping
+   is cheap because there's a single free body; for articulated
+   robots with MuJoCo, option (a) — `body_q` interpolation across
+   substeps — may be the better lever and remains TBD.
+
+**C. Terminal-z — Akinci-style coupling (2026-05-28).**
+   The coupling was reworked from the elastic spring
+   ``F = k_n·pen + c_n·max(0,-v_n)`` → plastic indentation (2026-05-25)
+   → Akinci-style SPH-pressure repulsion (2026-05-28).  The current law
+   ``F_n = max(P_i, 0) * dx^2 + c_n·max(0,-v_n)`` (zero on separation)
+   drives the normal force from the SPH pressure field; plasticity comes
+   from the granular DP constitutive model, eliminating the
+   ``bearing_capacity`` knob.  Quantitative validation against the
+   iterative formula ``δ = (0.14/μ_s)·√(ρ_s/ρ_g)·(2R)^(2/3)·(H+δ)^(1/3)``
+   (50 iterations) with canonical inputs predicts **24.0 mm** penetration
+   (see ``example_sph_column_sphere_drop.py``).
+
+**D. `test_final` criterion 2 (settling) — window-min fix applied (2026-05-28).**
+   The bounce-apex artefact (criterion 2 passing because ``|v_z| < 0.05 m/s``
+   at the apex of each bounce) is fixed in ``example_sph_column_sphere_drop``
+   by checking window-min ``|v_z|`` over the last 10 frames instead of
+   ``any(|v_z| < 0.05)``. The twoway example still uses ``any`` — fix is
+   deferred as a follow-up.
+
+**Status (2026-05-28)**: `example_sph_column_sphere_drop` validation target:
+5 criteria (no NaN, no punch-through, penetration depth ±20%, settled window-min,
+no leak). Run with::
+
+    uv run -m newton.examples sph.example_sph_column_sphere_drop --viewer null --test
+
+The example now supports ``--sand-bed-bottom`` (default 0.0) to extend
+the sand bed below z=0 for deeper energy-absorbing columns; use with
+caution — deep beds leak particles during impact unless
+``--penalty-stiffness`` is increased to ≥ 5e6.
+
+Court archive `.claude/.court/20260513-sph-mbd-coupling-quadruped/`
+retains the Phase 2d diagnostic chain; the 2026-05-14 tuning verdict
+reproduces from current worktree state.
+
 ## 11. Dead / silently-ignored knobs
 
 None at present. **Rule**: do not add silently-ignored knobs. Either

@@ -33,6 +33,11 @@ import newton
 
 from ...geometry import GeoType
 from ..solver import SolverBase
+from .sph_body_coupling import (
+    BodyCollider,
+    apply_body_coupling_force_kernel,
+    build_body_collider,
+)
 from .sph_boundary import ground_plane_penalty_kernel
 from .sph_constitutive import (
     initialize_geostatic_stress_kernel,
@@ -45,11 +50,14 @@ from .sph_implicit_viscosity import (
     apply_identity_kernel,
 )
 from .sph_kernels import (
+    apply_ppst_shift_kernel,
+    compute_ppst_shift_kernel,
     compute_strain_rate_kernel,
     half_step_position_kernel,
     integrate_symplectic_euler_kernel,
     integrate_verlet_final_kernel,
     make_compute_artificial_viscosity_kernel,
+    make_compute_correction_matrix_kernel,
     make_compute_density_kernel,
     make_compute_stress_force_kernel,
     make_compute_velocity_gradient_kernel,
@@ -124,6 +132,8 @@ class SolverSPH(SolverBase):
         """SDF penalty boundary damping [N*s/m]."""
         boundary_friction: float = 0.5
         """Coulomb friction coefficient mu for penalty boundary surfaces."""
+        boundary_wall_friction: float = 0.1
+        """Friction coefficient for vertical penalty walls [dimensionless]."""
         dummy_beta: float = 1.7
         """Distance-based dummy boundary extrapolation factor."""
         boundary_friction_viscosity: float = 0.1
@@ -166,6 +176,49 @@ class SolverSPH(SolverBase):
         # --- Corrections ---
         xsph_epsilon: float = 0.0
         """XSPH velocity smoothing factor (0 = off, 1 = full)."""
+        ppst_enabled: bool = False
+        """Hu et al. (2021) CMAME penetration-based particle shifting (PPST, Eq. 16).
+
+        When True, fluid particle positions are shifted at the end of each
+        substep to enforce particle regularity, with a 2nd-order velocity
+        correction ``u += grad(u) @ shift``. Free-surface safe: the shift is
+        proportional to ``|u| dt`` and the negative-penetration pull is capped
+        by ``ppst_delta_r0``, so no free-surface particle tracking is needed.
+        """
+        ppst_beta_1: float = 3.0
+        """PPST push coefficient for overlapping pairs (Hu 2021: 3.0)."""
+        ppst_beta_2: float = 1.0
+        """PPST pull coefficient for separated pairs (Hu 2021: 1.0)."""
+        ppst_delta_r0: float = -0.1
+        """PPST lower cap on dimensionless negative penetration (Hu 2021: -0.1)."""
+        ppst_velocity_correction: float = 0.0
+        """Scale of the 2nd-order PPST velocity correction ``u += c * grad(u) @ shift``.
+
+        0 (default) shifts positions only. The full correction (1.0) follows
+        Hu 2021 but can feed back unstably through sharp shear bands at
+        impact fronts; enable with care.
+        """
+        use_consistent_discretization: bool = False
+        """Hu et al. (2021) CMAME first-order-consistent gradient correction.
+
+        When True, the velocity-gradient and stress-force kernels compute the
+        per-fluid-particle 3x3 renormalisation matrix
+        ``G_i = (-Σ V_j r_ij ⊗ ∇W_ij)^{-1}`` and replace ``∇W_ij`` with
+        ``G_i · ∇W_ij`` in both kernels. This restores linear-field
+        consistency at boundaries where kernel support is truncated, at
+        the cost of pairwise momentum-conservation symmetry.
+
+        Default ``False`` to preserve the symmetric pressure-gradient form
+        used by all existing tests and validation experiments.
+        """
+
+        # --- Two-way coupling with rigid bodies (MBD) ---
+        body_coupling_enabled: bool = False
+        """Enable SDF + penalty coupling against shapes flagged ``ShapeFlags.COLLIDE_PARTICLES``."""
+        body_coupling_damping: float = 1.0
+        """Normal damping for body coupling [N*s/m]."""
+        body_coupling_friction: float = 0.5
+        """Coulomb friction coefficient between fluid particles and body colliders."""
 
         def __post_init__(self) -> None:
             supported_simulation_methods = {"dp", "mui"}
@@ -429,15 +482,36 @@ class SolverSPH(SolverBase):
                 )
                 self._fluid_count = n
 
+        # Body-coupling state: lazily initialized when enabled.
+        self._body_collider: BodyCollider | None = None
+        self._body_f_sand: wp.array[wp.spatial_vector] | None = None
+        if config.body_coupling_enabled:
+            self._init_body_coupling()
+
         # Specialize hot kernels on whether any dummy particles exist. Detection
         # must not use ``_fluid_count < n`` because the non-contiguous fallback
         # above forces ``_fluid_count = n`` even when dummies are present.
         self._has_dummies = bool(np.any(pt != 0))
+        self._use_consistent = config.use_consistent_discretization
         self._density_kernel = make_compute_density_kernel(self._has_dummies, self._density_has_walls)
-        self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(self._has_dummies)
-        self._stress_force_kernel = make_compute_stress_force_kernel(self._has_dummies)
+        self._velocity_gradient_kernel = make_compute_velocity_gradient_kernel(self._has_dummies, self._use_consistent)
+        self._stress_force_kernel = make_compute_stress_force_kernel(self._has_dummies, self._use_consistent)
         self._artificial_viscosity_kernel = make_compute_artificial_viscosity_kernel(self._has_dummies)
         self._xsph_kernel = make_xsph_correction_kernel(self._has_dummies)
+
+        # Hu 2021 G_i scratch (only when consistent discretisation is enabled)
+        if self._use_consistent:
+            self._correction_matrix_kernel = make_compute_correction_matrix_kernel(self._has_dummies)
+            self._correction_matrix = wp.zeros(n, dtype=wp.mat33, device=model.device)
+        else:
+            self._correction_matrix_kernel = None
+            self._correction_matrix = None
+
+        # Hu 2021 PPST scratch (only when particle shifting is enabled)
+        if config.ppst_enabled:
+            self._ppst_shift = wp.zeros(n, dtype=wp.vec3, device=model.device)
+        else:
+            self._ppst_shift = None
 
     def _extract_gravity_vec(self) -> wp.vec3:
         """Extract gravity as a :class:`wp.vec3` from the model array."""
@@ -536,6 +610,25 @@ class SolverSPH(SolverBase):
             transform = wp.transform(wp.vec3(px, py, pz), wp.quat(qx, qy, qz, qw))
             spheres.append((transform, float(sc[0])))
         return spheres
+    def _init_body_coupling(self) -> None:
+        """Build the body-collider table and per-body wrench accumulator.
+
+        Up-axis is required to be Z (``model.up_axis == 2``); the geostatic
+        init and ground-plane extraction both assume Z-up and no coupling
+        feature has been validated under a different convention.
+        """
+        if int(self.model.up_axis) != int(newton.Axis.Z):
+            raise ValueError(
+                "SPH body coupling requires Z-up models "
+                f"(model.up_axis = {int(self.model.up_axis)}, expected {int(newton.Axis.Z)}). "
+                "SPH solver kernels and geostatic init assume Z is the vertical axis."
+            )
+        self._body_collider = build_body_collider(self.model, self.model.device)
+        body_count = self.model.body_count
+        if body_count > 0:
+            self._body_f_sand = wp.zeros(body_count, dtype=wp.spatial_vector, device=self.model.device)
+        else:
+            self._body_f_sand = None
 
     @property
     def config(self) -> Config:
@@ -566,6 +659,8 @@ class SolverSPH(SolverBase):
                     self._volume_map_planes
                 )
                 self._density_has_walls = len(self._volume_map_planes) > 0
+            if self._config.body_coupling_enabled:
+                self._body_collider = build_body_collider(self.model, self.model.device)
 
     # ------------------------------------------------------------------
     # Main simulation step
@@ -620,6 +715,9 @@ class SolverSPH(SolverBase):
         # 2. Compute density (stored on state_in for use during force computation)
         self._compute_density(state_in)
 
+        # 2b. Hu 2021 G_i correction matrix (no-op when use_consistent_discretization is False)
+        self._compute_correction_matrix(state_in)
+
         # 3. Zero acceleration (cudaMemset is cheaper than a kernel launch)
         self._accel.zero_()
 
@@ -656,6 +754,11 @@ class SolverSPH(SolverBase):
                 density=state_in.sph.density,
             )
 
+        # 8b. Two-way coupling with MBD rigid bodies (optional).
+        if self._config.body_coupling_enabled:
+            self._apply_body_forces(state_in, dt)
+            state_out._sph_body_wrench = self._body_f_sand
+
         # 9. Time integration (symplectic Euler, includes gravity)
         self._integrate(state_in, state_out, dt)
 
@@ -668,6 +771,15 @@ class SolverSPH(SolverBase):
         # 10. XSPH velocity correction
         if self._config.xsph_epsilon > 0.0:
             self._xsph_correction(state_out)
+
+        # 10b. Hu 2021 PPST particle shifting (positions/velocities in-place)
+        if self._config.ppst_enabled:
+            self._apply_ppst(
+                state_out,
+                dt,
+                density=state_in.sph.density,
+                velocity_gradient=state_in.sph.velocity_gradient,
+            )
 
         # 11. Copy density to state_out for continuity across steps
         wp.copy(state_out.sph.density, state_in.sph.density)
@@ -702,6 +814,9 @@ class SolverSPH(SolverBase):
         # 3. Compute density at midpoint -> write to state_out
         #    Use state_in density as Shepard correction reference (not stale state_out)
         self._compute_density(state_out, pos=self._pos_mid, density_prev_source=state_in.sph.density)
+
+        # 3b. Hu 2021 G_i correction at midpoint (no-op when disabled)
+        self._compute_correction_matrix(state_out, pos=self._pos_mid)
 
         # 4. Zero acceleration
         self._accel.zero_()
@@ -749,6 +864,12 @@ class SolverSPH(SolverBase):
                 density=state_out.sph.density,
             )
 
+        # 8b. Two-way coupling with MBD rigid bodies (optional, midpoint config).
+        #     Density at midpoint lives in state_out (computed in step 3).
+        if self._config.body_coupling_enabled:
+            self._apply_body_forces(state_out, dt, pos=self._pos_mid, vel=state_in.particle_qd)
+            state_out._sph_body_wrench = self._body_f_sand
+
         # 9. Full-step velocity + final position
         self._integrate_verlet_final(state_in, state_out, dt)
 
@@ -759,6 +880,10 @@ class SolverSPH(SolverBase):
         # 10. XSPH velocity correction (uses midpoint hash grid)
         if self._config.xsph_epsilon > 0.0:
             self._xsph_correction(state_out)
+
+        # 10b. Hu 2021 PPST particle shifting (positions/velocities in-place)
+        if self._config.ppst_enabled:
+            self._apply_ppst(state_out, dt)
 
         # Density was computed directly into state_out in step 3 — no copy needed.
 
@@ -833,6 +958,34 @@ class SolverSPH(SolverBase):
             device=self.model.device,
         )
 
+    def _compute_correction_matrix(
+        self,
+        state: newton.State,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+    ) -> None:
+        """Compute Hu 2021 G_i correction matrix from current positions and density."""
+        if not self._use_consistent:
+            return
+        positions = pos if pos is not None else state.particle_q
+        wp.launch(
+            self._correction_matrix_kernel,
+            dim=self._fluid_count,
+            inputs=[
+                self._hash_grid.id,
+                positions,
+                self.model.particle_mass,
+                state.sph.density,
+                self.model.particle_flags,
+                self._particle_type,
+                self._h,
+                self._support_radius,
+                self._config.reference_density,
+            ],
+            outputs=[self._correction_matrix],
+            device=self.model.device,
+        )
+
     def _compute_velocity_gradient(
         self,
         state: newton.State,
@@ -843,6 +996,29 @@ class SolverSPH(SolverBase):
         """Compute SPH velocity gradient tensor."""
         positions = pos if pos is not None else state.particle_q
         velocities = vel if vel is not None else state.particle_qd
+        if self._use_consistent:
+            wp.launch(
+                self._velocity_gradient_kernel,
+                dim=self._fluid_count,
+                inputs=[
+                    self._hash_grid.id,
+                    positions,
+                    velocities,
+                    self.model.particle_mass,
+                    state.sph.density,
+                    self._correction_matrix,
+                    self.model.particle_flags,
+                    self._particle_type,
+                    self._wall_normal,
+                    self._h,
+                    self._support_radius,
+                    self._config.dummy_beta,
+                    self._config.reference_density,
+                ],
+                outputs=[state.sph.velocity_gradient],
+                device=self.model.device,
+            )
+            return
         wp.launch(
             self._velocity_gradient_kernel,
             dim=self._fluid_count,
@@ -895,6 +1071,12 @@ class SolverSPH(SolverBase):
         vg = velocity_gradient if velocity_gradient is not None else state_in.sph.velocity_gradient
         # Copy plastic_strain from state_in to state_out for accumulation
         wp.copy(state_out.sph.plastic_strain, state_in.sph.plastic_strain)
+        # Propagate stress in→out for non-fluid particles.  The DP kernel skips
+        # them and would otherwise leave state_out.sph.stress at its previous-
+        # step (possibly stale) value; downstream stress-force reads from
+        # state_out, so non-fluid stresses (e.g. Shepard-interpolated embedded
+        # dummy stress) must be carried through here.
+        wp.copy(state_out.sph.stress, state_in.sph.stress)
         wp.launch(
             update_stress_dp_kernel,
             dim=self._fluid_count,
@@ -933,6 +1115,8 @@ class SolverSPH(SolverBase):
         """
         sr = strain_rate if strain_rate is not None else state_in.sph.strain_rate
         rho = density if density is not None else state_in.sph.density
+        # Propagate non-fluid stress in→out (mui kernel skips non-fluid).
+        wp.copy(state_out.sph.stress, state_in.sph.stress)
         wp.launch(
             update_stress_mui_kernel,
             dim=self._fluid_count,
@@ -971,6 +1155,28 @@ class SolverSPH(SolverBase):
         positions = pos if pos is not None else state_in.particle_q
         rho = density if density is not None else state_in.sph.density
         gravity_vec = self._gravity_vec
+        if self._use_consistent:
+            wp.launch(
+                self._stress_force_kernel,
+                dim=self._fluid_count,
+                inputs=[
+                    self._hash_grid.id,
+                    positions,
+                    self.model.particle_mass,
+                    rho,
+                    state_out.sph.stress,
+                    self._correction_matrix,
+                    self.model.particle_flags,
+                    self._particle_type,
+                    self._h,
+                    self._support_radius,
+                    self._config.reference_density,
+                    gravity_vec,
+                ],
+                outputs=[self._accel],
+                device=self.model.device,
+            )
+            return
         wp.launch(
             self._stress_force_kernel,
             dim=self._fluid_count,
@@ -1042,6 +1248,10 @@ class SolverSPH(SolverBase):
         velocities = vel if vel is not None else state.particle_qd
         n = self.model.particle_count
         for normal, offset in self._ground_planes:
+            # Classify plane: an inward normal pointing mostly upward (n.z > 0.5)
+            # is a floor; otherwise it is a vertical wall.
+            is_floor = normal[2] > 0.5
+            mu = self._config.boundary_friction if is_floor else self._config.boundary_wall_friction
             wp.launch(
                 ground_plane_penalty_kernel,
                 dim=n,
@@ -1054,7 +1264,7 @@ class SolverSPH(SolverBase):
                     offset,
                     self._config.penalty_stiffness,
                     self._config.penalty_damping,
-                    self._config.boundary_friction,
+                    mu,
                 ],
                 outputs=[self._accel],
                 device=self.model.device,
@@ -1288,6 +1498,72 @@ class SolverSPH(SolverBase):
 
         # Warm start with v*; CG converges in 0 iterations for interior particles.
         solver.solve(state.particle_qd, b, flags, ptype, apply_op)
+    def _apply_body_forces(
+        self,
+        state: newton.State,
+        dt: float,
+        *,
+        pos: wp.array[wp.vec3] | None = None,
+        vel: wp.array[wp.vec3] | None = None,
+    ) -> None:
+        """Apply SDF + penalty coupling forces against rigid-body colliders.
+
+        Launches the coupling kernel over the full particle array (kernel
+        self-guards on fluid type). Zeros the per-body wrench accumulator
+        before launching, so each :meth:`step` call starts from a fresh
+        accumulation. The result is stored on ``state_out._sph_body_wrench``
+        at the end of each step path.
+        """
+        collider = self._body_collider
+        if collider is None or collider.count == 0 or self._body_f_sand is None:
+            return
+        self._body_f_sand.zero_()
+        positions = pos if pos is not None else state.particle_q
+        velocities = vel if vel is not None else state.particle_qd
+        wp.launch(
+            apply_body_coupling_force_kernel,
+            dim=self.model.particle_count,
+            inputs=[
+                positions,
+                velocities,
+                self.model.particle_flags,
+                self._particle_type,
+                state.sph.density,
+                self.model.particle_mass,
+                state.sph.stress,
+                state.body_q,
+                state.body_qd,
+                self.model.body_com,
+                collider.body_id,
+                collider.shape_type,
+                collider.shape_params,
+                collider.shape_xform,
+                collider.count,
+                self._config.body_coupling_damping,
+                self._config.body_coupling_friction,
+                self._config.particle_spacing,
+            ],
+            outputs=[self._accel, self._body_f_sand],
+            device=self.model.device,
+        )
+
+    def collect_body_wrench(self, state: newton.State) -> wp.array[wp.spatial_vector] | None:
+        """Return the sand-on-body wrench stored on ``state`` from the last step.
+
+        Each :meth:`step` call zeros the internal accumulator, recomputes the
+        wrench, and stores it on the output state as ``_sph_body_wrench``.
+        Callers should read it once per substep before the next :meth:`step`
+        overwrites it.
+
+        The array has length ``Model.body_count`` with entries
+        ``wp.spatial_vector(force_world, torque_world)`` in [N, N*m]; integrate
+        it into :attr:`State.body_f` before the MBD step (see the MPM two-way
+        coupling example for the integration pattern).
+
+        Returns ``None`` when body coupling is disabled or the model has no
+        bodies.
+        """
+        return getattr(state, "_sph_body_wrench", None)
 
     def _integrate(self, state_in: newton.State, state_out: newton.State, dt: float) -> None:
         """Symplectic Euler time integration."""
@@ -1332,6 +1608,65 @@ class SolverSPH(SolverBase):
                 self._config.reference_density,
             ],
             outputs=[state.particle_qd],
+            device=self.model.device,
+        )
+
+    def _apply_ppst(
+        self,
+        state: newton.State,
+        dt: float,
+        density: wp.array | None = None,
+        velocity_gradient: wp.array | None = None,
+    ) -> None:
+        """Hu 2021 PPST: shift fluid positions and velocities in-place.
+
+        Queries the hash grid built earlier in the step. Positions have
+        moved at most ``|u| dt`` since the build, which is well inside the
+        support-radius slack for this regularisation term.
+
+        Args:
+            state: State whose ``particle_q`` / ``particle_qd`` are shifted.
+            dt: Substep size [s].
+            density: Density array to derive the fictitious sphere diameter
+                from. Defaults to ``state.sph.density``.
+            velocity_gradient: Velocity-gradient array for the 2nd-order
+                velocity correction. Defaults to ``state.sph.velocity_gradient``.
+        """
+        rho = density if density is not None else state.sph.density
+        grad_v = velocity_gradient if velocity_gradient is not None else state.sph.velocity_gradient
+        wp.launch(
+            compute_ppst_shift_kernel,
+            dim=self._fluid_count,
+            inputs=[
+                self._hash_grid.id,
+                state.particle_q,
+                state.particle_qd,
+                self.model.particle_mass,
+                rho,
+                self.model.particle_flags,
+                self._particle_type,
+                self._support_radius,
+                self._config.reference_density,
+                dt,
+                self._config.ppst_beta_1,
+                self._config.ppst_beta_2,
+                self._config.ppst_delta_r0,
+                0.2 * self._h,
+            ],
+            outputs=[self._ppst_shift],
+            device=self.model.device,
+        )
+        wp.launch(
+            apply_ppst_shift_kernel,
+            dim=self._fluid_count,
+            inputs=[
+                self._ppst_shift,
+                grad_v,
+                self.model.particle_flags,
+                self._particle_type,
+                self._config.ppst_velocity_correction,
+            ],
+            outputs=[state.particle_q, state.particle_qd],
             device=self.model.device,
         )
 

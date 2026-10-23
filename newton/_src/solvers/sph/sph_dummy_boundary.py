@@ -37,10 +37,17 @@ SPH_DUMMY_NOSLIP = wp.constant(1)
 """Dummy particle with no-slip wall condition."""
 SPH_DUMMY_FREESLIP = wp.constant(2)
 """Dummy particle with free-slip wall condition."""
+SPH_DUMMY_EMBEDDED = wp.constant(3)
+"""Embedded dummy particle whose stress is kernel-interpolated from fluid neighbours.
+
+Uses Hu et al. (2021) CMAME Shepard-interpolation scheme instead of the
+hydrostatic extrapolation used for rigid wall dummies.
+"""
 
 # Plain Python constants for use in numpy/host code
 _SPH_DUMMY_NOSLIP_VAL = 1
 _SPH_DUMMY_FREESLIP_VAL = 2
+_SPH_DUMMY_EMBEDDED_VAL = 3
 
 _EPSILON = wp.constant(1.0e-8)
 
@@ -69,7 +76,7 @@ def compute_virtual_velocity(
     Returns:
         Virtual velocity for the dummy particle.
     """
-    if particle_type_j == SPH_DUMMY_NOSLIP:
+    if particle_type_j == SPH_DUMMY_NOSLIP or particle_type_j == SPH_DUMMY_EMBEDDED:
         # No-slip: v_vir = (1 - beta) * v_fluid + beta * v_wall
         return (1.0 - beta) * v_fluid + beta * v_wall
     # Free-slip: mirror normal component
